@@ -33,6 +33,7 @@ def chat_service(mock_openai_client):
     ) as mock_settings:
         mock_settings.chat_max_context_tokens = 50000
         mock_settings.openai_api_key = "test-key"
+        mock_settings.chat_default_model_id = "gpt-5"
 
         service = ChatService()
         service.openai_client = mock_openai_client
@@ -42,7 +43,7 @@ def chat_service(mock_openai_client):
 @pytest.mark.asyncio
 async def test_chat_stream_no_results(chat_service, mock_search_client):
     with patch("app.chat.get_search_client", return_value=mock_search_client):
-        request = ChatRequest(q="test query")
+        request = ChatRequest(q="test query", model_id="gpt-5")
 
         chunks = []
         async for chunk_data in chat_service.chat_stream(request, "test_user"):
@@ -98,7 +99,7 @@ async def test_chat_stream_with_openai_response(chat_service):
         mock_assembler.count_tokens.return_value = 100
         mock_assembler_class.return_value = mock_assembler
 
-        request = ChatRequest(q="test query")
+        request = ChatRequest(q="test query", model_id="gpt-5")
         chunks = []
         async for chunk_data in chat_service.chat_stream(request, "test_user"):
             if chunk_data.startswith("data: "):
@@ -119,7 +120,7 @@ async def test_chat_stream_error_handling(chat_service):
         mock_client.search = AsyncMock(side_effect=Exception("Search error"))
         mock_get_client.return_value = mock_client
 
-        request = ChatRequest(q="test query")
+        request = ChatRequest(q="test query", model_id="gpt-5")
         chunks = []
         async for chunk_data in chat_service.chat_stream(request, "test_user"):
             if chunk_data.startswith("data: "):

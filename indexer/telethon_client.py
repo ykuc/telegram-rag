@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sqlite3
 from typing import List, Optional, Dict, AsyncGenerator, Any
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
@@ -16,9 +17,11 @@ from telethon.tl.types import (
     MessageActionChatDeleteUser,
     MessageActionChatAddUser,
 )
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError
 from settings import settings
 from normalize import format_sender_name, extract_chat_type
+from telegram_auth import authenticate_via_qr
+from telethon_session import configure_telethon_session_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,12 @@ class TelethonClientWrapper:
             logger.info("Using Telethon stub mode")
             return
 
-        await self.client.start(phone=settings.tg_phone)
+        phone = settings.tg_phone
+        if isinstance(phone, str) and phone.strip():
+            await self.client.start(phone=phone.strip())
+        else:
+            await authenticate_via_qr(self.client)
+        configure_telethon_session_sqlite(self.client)
         self.me = await self.client.get_me()
         logger.info(
             f"Connected as {self.me.first_name} (@{self.me.username or 'no_username'})"
@@ -46,8 +54,16 @@ class TelethonClientWrapper:
 
     async def stop(self):
         """Stop Telethon client."""
-        if not settings.telethon_stub:
+        if settings.telethon_stub:
+            return
+        if not self.client.is_connected():
+            return
+        try:
             await self.client.disconnect()
+        except sqlite3.OperationalError as exc:
+            logger.warning("Telethon session save on disconnect failed: %s", exc)
+        except Exception as exc:
+            logger.warning("Telethon disconnect failed: %s", exc)
 
     def is_connected(self) -> bool:
         """Return connection status for the underlying client."""
@@ -173,6 +189,10 @@ class TelethonClientWrapper:
         since_date: Optional[datetime] = None,
         reverse: bool = False,
         min_message_id: Optional[int] = None,
+        offset_message_id: Optional[int] = None,
+        *,
+        bulk_fetch: bool = False,
+        inter_message_delay_secs: Optional[float] = None,
     ) -> AsyncGenerator[Message, None]:
         """
         Get messages from a chat.
@@ -182,7 +202,18 @@ class TelethonClientWrapper:
             limit: Maximum number of messages
             since_date: Only fetch messages newer than this date
             reverse: If True, fetch from oldest to newest
+            bulk_fetch: History/backfill mode; uses telethon_inter_message_delay_secs
+            inter_message_delay_secs: Override pause after each yielded message
         """
+        if inter_message_delay_secs is None:
+            inter_message_delay_secs = float(settings.telethon_inter_message_delay_secs)
+            if not bulk_fetch and inter_message_delay_secs <= 0:
+                inter_message_delay_secs = 0.1
+
+        iter_wait_secs = float(settings.telethon_iter_wait_secs)
+        if iter_wait_secs < 0:
+            iter_wait_secs = 0.0
+
         if settings.telethon_stub:
             async for msg in self._stub_get_messages(
                 entity, limit, since_date, min_message_id
@@ -193,17 +224,34 @@ class TelethonClientWrapper:
         try:
             kwargs = {
                 "reverse": reverse,
-                "wait_time": 1,  # Rate limiting
+                "wait_time": iter_wait_secs,
             }
 
             if limit:
                 kwargs["limit"] = limit
-            if since_date:
+            # offset_date returns messages older than the date and does not stop.
+            # For a lower bound, walk newest-first and stop once we pass it.
+            if since_date and reverse:
                 kwargs["offset_date"] = since_date
             if min_message_id is not None:
                 kwargs["min_id"] = min_message_id
+            if offset_message_id:
+                kwargs["offset_id"] = offset_message_id
 
             async for message in self.client.iter_messages(entity, **kwargs):
+                if (
+                    since_date
+                    and not reverse
+                    and message.date
+                    and message.date.timestamp() < since_date.timestamp()
+                ):
+                    logger.info(
+                        "Reached lower bound %s at message %s (%s); stopping",
+                        since_date.strftime("%Y-%m-%d %H:%M"),
+                        message.id,
+                        message.date.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    break
                 # Skip service messages that we can't process
                 if message.action:
                     continue
@@ -216,8 +264,8 @@ class TelethonClientWrapper:
 
                 yield message
 
-                # Rate limiting
-                await asyncio.sleep(0.1)
+                if inter_message_delay_secs > 0:
+                    await asyncio.sleep(inter_message_delay_secs)
 
         except FloodWaitError as e:
             logger.warning(f"Hit flood wait, sleeping for {e.seconds} seconds")

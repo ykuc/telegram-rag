@@ -29,6 +29,7 @@
 - Frameworks: `pytest` (Python), `vitest` (UI), `playwright` (E2E).
 - Use VS Code Test Explorer; mock with `patch()` in tests (avoid global module mocking).
 - Discovery: tests under `api/tests` and `indexer/tests` named `test_*.py`.
+- **No production or personal data in tests:** use synthetic placeholders only (e.g. chat id `10001`, username `testuser`, fixed epoch timestamps). Do not copy real Telegram chat IDs, `@handles`, message dates from `.env`/Postgres, or other live deployment values into test code.
 - Before PR: run `make test-python`, `make test-ui`, and optional `scripts/smoke_tests.sh`.
 
 ## Commit & PR Guidelines

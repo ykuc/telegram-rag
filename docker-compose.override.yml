@@ -22,11 +22,6 @@ services:
       - ASTRO_TELEMETRY_DISABLED=1
       - NODE_OPTIONS=--max-old-space-size=640
 
-  indexer:
-    build: ./indexer
-    volumes:
-      - ./indexer/sessions:/sessions
-
   postgres:
     ports:
       - "5432:5432"

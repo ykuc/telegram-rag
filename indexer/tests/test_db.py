@@ -27,6 +27,9 @@ class FakeConnection:
     async def fetch(self, sql, *args):
         return self._fetch_values
 
+    async def fetchval(self, sql, *args):
+        return getattr(self, "_fetchval_value", None)
+
 
 def connection_cm(fake_conn):
     async def _acquire():
@@ -143,3 +146,15 @@ async def test_mark_chunks_deleted_executes_update():
     with patch.object(dbm, "get_connection", return_value=DummyCtx(fake_conn)):
         await dbm.mark_chunks_deleted("chat1", 1, 999)
     assert any("UPDATE chunks SET deleted_at" in sql for sql, _ in fake_conn.executed)
+
+
+@pytest.mark.asyncio
+async def test_get_latest_message_id():
+    dbm = DatabaseManager("postgresql://user:pass@host/db")
+    fake_conn = FakeConnection()
+    fake_conn._fetchval_value = 12345
+
+    with patch.object(dbm, "get_connection", return_value=DummyCtx(fake_conn)):
+        result = await dbm.get_latest_message_id("chat1")
+
+    assert result == 12345

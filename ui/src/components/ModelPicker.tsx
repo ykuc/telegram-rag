@@ -6,6 +6,8 @@ interface Model {
   id: string;
 }
 
+type LoadState = "loading" | "ready" | "error" | "empty";
+
 interface ModelPickerProps {
   onModelChange?: (modelId: string) => void;
   value?: string;
@@ -18,14 +20,30 @@ export default function ModelPicker({
   const [models, setModels] = useState<Model[]>([]);
   const [selected, setSelected] = useState<string>(value || "");
   const [isOpen, setIsOpen] = useState(false);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [errorMessage, setErrorMessage] = useState<string>("");
 
   useEffect(() => {
+    setLoadState("loading");
+    setErrorMessage("");
     fetchModels()
       .then((data) => {
+        if (!data?.length) {
+          setModels([]);
+          setLoadState("empty");
+          return;
+        }
         setModels(data);
-        if (!value) {
-          const stored = localStorage.getItem("selected_model_id");
-          const initialModel = stored || data[0]?.id || "";
+        setLoadState("ready");
+        if (value === undefined) {
+          let stored: string | null = null;
+          try {
+            stored = localStorage.getItem("selected_model_id");
+          } catch {
+            stored = null;
+          }
+          const storedValid = data.some((m) => m.id === stored);
+          const initialModel = (storedValid && stored) || data[0]?.id || "";
           setSelected(initialModel);
           if (onModelChange && initialModel) {
             onModelChange(initialModel);
@@ -33,9 +51,16 @@ export default function ModelPicker({
         }
       })
       .catch((res) => {
-        if (res.status === 401) window.location.href = "/login";
+        if (res?.status === 401) {
+          window.location.href = "/login";
+          return;
+        }
+        setModels([]);
+        setLoadState("error");
+        setErrorMessage("Could not load models from the API.");
       });
-  }, [value, onModelChange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (value !== undefined) {
@@ -44,7 +69,12 @@ export default function ModelPicker({
   }, [value]);
 
   useEffect(() => {
-    if (selected) localStorage.setItem("selected_model_id", selected);
+    if (!selected) return;
+    try {
+      localStorage.setItem("selected_model_id", selected);
+    } catch {
+      // Ignore when storage is unavailable (e.g. private mode, test env).
+    }
   }, [selected]);
 
   const handleModelSelect = (modelId: string) => {
@@ -55,11 +85,32 @@ export default function ModelPicker({
     }
   };
 
-  if (!models.length) {
+  if (loadState === "loading") {
     return (
       <div className="flex items-center gap-2 px-3 py-2 bg-gray-100 rounded-lg">
         <div className="w-4 h-4 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin"></div>
         <span className="text-sm text-gray-600">Loading models...</span>
+      </div>
+    );
+  }
+
+  if (loadState === "error") {
+    return (
+      <div
+        className="flex items-center gap-2 px-3 py-2 bg-red-50 rounded-lg border border-red-200"
+        role="alert"
+      >
+        <span className="text-sm text-red-700">{errorMessage}</span>
+      </div>
+    );
+  }
+
+  if (loadState === "empty") {
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 rounded-lg border border-amber-200">
+        <span className="text-sm text-amber-800">
+          No chat models available.
+        </span>
       </div>
     );
   }

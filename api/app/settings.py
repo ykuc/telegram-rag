@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     cors_allow_all: bool = False
     # Search / Embeddings
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     embed_model: str = "text-embedding-3-large"
     embed_dimensions: int = 3072
     vespa_endpoint: str = "http://vespa:8080"
@@ -93,6 +94,7 @@ class Settings(BaseSettings):
     chat_default_k: int = 50
     chat_max_context_tokens: int = 50000
     chat_rate_limit_rpm: int = 30
+    chat_default_model_id: str | None = None
     # Chat decision models (separate from user-selected model)
     chat_search_decision_model: str = "gpt-4.1"
     chat_reformulation_model: str = "gpt-4.1"

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # OpenAI
     # Optional in tests; required in production runtime paths that use Embedder
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     embed_model: str = "text-embedding-3-large"
     embed_dimensions: int = 3072
     embed_batch_size: int = 64
@@ -23,8 +24,17 @@ class Settings(BaseSettings):
     tg_api_id: int | None = None
     tg_api_hash: str | None = None
     tg_phone: str | None = None
+    tg_qr_login_timeout_secs: int = 120
     telethon_session_path: str = "/sessions/telethon.session"
     backfill_state_path: str = "/sessions/backfill_state.json"
+    # Comma-separated chat IDs/usernames for daemon mode (overridden by --chats)
+    indexer_chats: str | None = None
+    # Re-index this many days before DB max message_date on daemon startup (edits/missed)
+    indexer_incremental_days: int = 1
+    # Seconds between GetHistoryRequest calls (Telegram RPC pacing; Telethon recommends ~1)
+    telethon_iter_wait_secs: float = 1.0
+    # Optional pause after each yielded message; bulk fetch typically uses 0
+    telethon_inter_message_delay_secs: float = 0.0
 
     # Storage (optional for tests that mock DB)
     database_url: str | None = None
@@ -73,7 +83,7 @@ class CLIArgs(BaseModel):
     daemon_worker_concurrency: int = 3
     hourly_sweep_days: int = 7
     hourly_sweep_interval_minutes: int = 60
-    backfill_state_path: str = settings.backfill_state_path
+    backfill_state_path: Optional[str] = settings.backfill_state_path
     backfill_checkpoint_interval: int = 50
     lookback_message_limit: int = 250
 

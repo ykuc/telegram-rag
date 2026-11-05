@@ -1,31 +1,75 @@
-"""Model configuration and utilities."""
+"""Chat model catalog from the configured OpenAI-compatible provider."""
 
-from typing import Dict, List
+from __future__ import annotations
 
+import logging
+from typing import Any, Dict, List
 
-# Single source of truth for model configurations
-AVAILABLE_MODELS: List[Dict[str, str]] = [
-    {"label": "gpt 5", "id": "gpt-5"},
-    {"label": "gpt5 mini", "id": "gpt-5-mini"},
-    {"label": "gpt5 nano", "id": "gpt-5-nano"},
-]
+import httpx
 
-# Create mapping from label to id for easy lookup
-MODEL_LABEL_TO_ID: Dict[str, str] = {
-    model["label"]: model["id"] for model in AVAILABLE_MODELS
-}
+from .settings import settings
 
-# Default model ID (first in the list)
-DEFAULT_MODEL_ID = AVAILABLE_MODELS[0]["id"]
+logger = logging.getLogger(__name__)
+
+DEFAULT_OPENAI_V1 = "https://api.openai.com/v1"
 
 
-def get_available_models() -> List[Dict[str, str]]:
-    """Get list of available models for API responses."""
-    return AVAILABLE_MODELS.copy()
+def _provider_models_url() -> str:
+    base = (settings.openai_base_url or DEFAULT_OPENAI_V1).rstrip("/")
+    return f"{base}/models?verbose=true"
 
 
-def resolve_model_id(model_label: str | None) -> str:
-    """Resolve model label to actual model ID."""
-    if not model_label:
-        return DEFAULT_MODEL_ID
-    return MODEL_LABEL_TO_ID.get(model_label, DEFAULT_MODEL_ID)
+def is_chat_model_entry(entry: Dict[str, Any]) -> bool:
+    """Include text chat models; keep entries without modality (official OpenAI)."""
+    architecture = entry.get("architecture")
+    if not isinstance(architecture, dict):
+        return True
+    modality = architecture.get("modality")
+    if modality is None:
+        return True
+    return modality == "text->text"
+
+
+def entry_to_model_option(entry: Dict[str, Any]) -> Dict[str, str]:
+    model_id = entry.get("id")
+    if not model_id or not isinstance(model_id, str):
+        raise ValueError("Model entry missing id")
+    name = entry.get("name")
+    label = name if isinstance(name, str) and name.strip() else model_id
+    return {"id": model_id, "label": label}
+
+
+async def fetch_chat_models_from_provider() -> List[Dict[str, str]]:
+    """List chat models from GET /v1/models?verbose=true."""
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY is required")
+
+    url = _provider_models_url()
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ValueError("Invalid models list response from provider")
+
+    models: List[Dict[str, str]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if not is_chat_model_entry(entry):
+            continue
+        try:
+            models.append(entry_to_model_option(entry))
+        except ValueError:
+            logger.warning("Skipping invalid model entry: %s", entry)
+            continue
+
+    models.sort(key=lambda item: item["label"].lower())
+    if not models:
+        raise ValueError("No chat models returned from provider")
+    return models

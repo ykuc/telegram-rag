@@ -1,4 +1,5 @@
-telethon==1.36.0
+telethon==1.45.0
+qrcode==8.0
 # asyncpg wheels not yet available for early Python 3.13 builds; skip install under 3.13+
 asyncpg==0.29.0; python_version < '3.13'
 openai==1.52.0

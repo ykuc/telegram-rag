@@ -169,6 +169,24 @@ class DatabaseManager:
             )
             return [Chunk(**dict(row)) for row in rows]
 
+    async def get_latest_message_date(self, chat_id: str) -> Optional[int]:
+        """Latest indexed message_date (unix seconds) for a chat, if any."""
+        async with self.get_connection() as conn:
+            value = await conn.fetchval(
+                "SELECT MAX(message_date) FROM chunks WHERE chat_id = $1",
+                chat_id,
+            )
+            return int(value) if value is not None else None
+
+    async def get_latest_message_id(self, chat_id: str) -> Optional[int]:
+        """Latest indexed message_id for a chat, if any."""
+        async with self.get_connection() as conn:
+            value = await conn.fetchval(
+                "SELECT MAX(message_id) FROM chunks WHERE chat_id = $1",
+                chat_id,
+            )
+            return int(value) if value is not None else None
+
     async def upsert_chunk(self, chunk: Chunk):
         """Insert or update a chunk."""
         async with self.get_connection() as conn:

@@ -1,21 +1,11 @@
 """Tests for text chunker."""
 
-import pytest
-from unittest.mock import MagicMock, patch
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
-# Add the indexer directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Mock settings globally before any imports
-sys.modules["settings"] = MagicMock()
-mock_settings = MagicMock()
-mock_settings.target_chunk_tokens = 512
-mock_settings.chunk_overlap_tokens = 50
-sys.modules["settings"].settings = mock_settings
-
-# Now we can safely import chunker
 from chunker import TextChunker
 
 
@@ -24,7 +14,10 @@ class TestTextChunker:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.chunker = TextChunker()
+        with patch("chunker.settings") as mock_settings:
+            mock_settings.target_chunk_tokens = 512
+            mock_settings.chunk_overlap_tokens = 50
+            self.chunker = TextChunker()
 
     def test_token_counting(self):
         """Test token counting functionality."""

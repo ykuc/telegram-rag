@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import hashlib
 from unittest.mock import MagicMock, AsyncMock, patch
 from datetime import datetime, timedelta
 import sys
@@ -27,6 +28,7 @@ def mock_cli_args():
         embed_concurrency=2,
         sleep_ms=0,
         log_level="INFO",
+        backfill_state_path=None,
     )
     return args
 
@@ -46,6 +48,7 @@ def mock_indexer_deps():
         mock_db.initialize = AsyncMock()
         mock_db.close = AsyncMock()
         mock_db.get_existing_chunks = AsyncMock(return_value=[])
+        mock_db.get_latest_message_date = AsyncMock(return_value=None)
         mock_db.upsert_chunk = AsyncMock()
         mock_db_class.return_value = mock_db
 
@@ -100,11 +103,30 @@ def mock_indexer_deps():
         mock_chunker.chunk_text = MagicMock(return_value=[("Test chunk", "test chunk")])
         mock_chunker_class.return_value = mock_chunker
 
+        def mock_compute_text_hash(text, lang=None):
+            from settings import settings as indexer_settings
+
+            cache_key = (
+                f"{text}|{indexer_settings.embed_model}|"
+                f"{indexer_settings.chunking_version}|"
+                f"{indexer_settings.preprocess_version}|{lang or ''}"
+            )
+            return hashlib.sha256(cache_key.encode()).hexdigest()
+
+        async def mock_embed_texts(texts, dry_run=False):
+            del dry_run
+            results = []
+            for text in texts:
+                text_hash = mock_compute_text_hash(text)
+                results.append((text_hash, [0.1, 0.2, 0.3]))
+            return results
+
         # Mock embedder
         mock_embedder = AsyncMock()
-        mock_embedder.embed_texts = AsyncMock(
-            return_value=[("hash123", [0.1, 0.2, 0.3])]
-        )
+        mock_embedder.batch_size = 64
+        mock_embedder.concurrency = 4
+        mock_embedder._compute_text_hash = mock_compute_text_hash
+        mock_embedder.embed_texts = AsyncMock(side_effect=mock_embed_texts)
         mock_embedder.metrics = MagicMock()
         mock_embedder.metrics.embed_calls = 0
         mock_embedder.metrics.embed_cached_hits = 0
@@ -161,7 +183,7 @@ class TestTelegramIndexer:
         processed_messages = []
 
         # Mock get_messages to return different messages for each chat
-        async def mock_get_messages(entity, limit=None, since_date=None):
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
             if entity == "entity1":
                 messages = messages_per_chat["Chat1"]
                 chat_name = "Chat1"
@@ -245,7 +267,7 @@ class TestTelegramIndexer:
             ],  # 3 messages
         }
 
-        async def mock_get_messages(entity, limit=None, since_date=None):
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
             if entity == "entity1":
                 messages = messages_per_chat["Chat1"]
             elif entity == "entity2":
@@ -307,7 +329,7 @@ class TestTelegramIndexer:
             ],  # 5 messages
         }
 
-        async def mock_get_messages(entity, limit=None, since_date=None):
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
             if entity == "entity1":
                 messages = messages_per_chat["Chat1"]
             elif entity == "entity2":
@@ -340,10 +362,9 @@ class TestTelegramIndexer:
         await indexer.run_once()
 
         # Verify: Should process exactly 5 messages (all from Chat1, none from Chat2)
-        embed_calls = len(mock_indexer_deps["embedder"].embed_texts.call_args_list)
         assert (
-            embed_calls == 5
-        ), f"Expected exactly 5 embedding calls, got {embed_calls}"
+            indexer.metrics.messages_indexed == 5
+        ), f"Expected exactly 5 messages indexed, got {indexer.metrics.messages_indexed}"
 
     @pytest.mark.asyncio
     async def test_specific_chats_with_limit(self, mock_cli_args, mock_indexer_deps):
@@ -386,7 +407,7 @@ class TestTelegramIndexer:
             ],  # 5 messages
         }
 
-        async def mock_get_messages(entity, limit=None, since_date=None):
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
             if entity == "entity1":
                 messages = messages_per_chat["Chat1"]
             elif entity == "entity2":
@@ -413,10 +434,9 @@ class TestTelegramIndexer:
         await indexer.run_once()
 
         # Verify: Should process exactly 3 messages total across specified chats
-        embed_calls = len(mock_indexer_deps["embedder"].embed_texts.call_args_list)
         assert (
-            embed_calls == 3
-        ), f"Expected exactly 3 embedding calls, got {embed_calls}"
+            indexer.metrics.messages_indexed == 3
+        ), f"Expected exactly 3 messages indexed, got {indexer.metrics.messages_indexed}"
 
         # Verify get_all_chats was not called since specific chats were provided
         mock_indexer_deps["tg"].get_all_chats.assert_not_called()
@@ -431,7 +451,7 @@ class TestTelegramIndexer:
 
         since_values = []
 
-        async def mock_get_messages(entity, limit=None, since_date=None):
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
             since_values.append(since_date)
             yield self._create_mock_message(1, "Test message")
 
@@ -455,6 +475,117 @@ class TestTelegramIndexer:
         assert (
             since_values[0] is None
         ), "Expected since_date to be None for full history"
+
+    @pytest.mark.asyncio
+    async def test_days_window_is_per_chat(self, mock_cli_args, mock_indexer_deps):
+        """--days uses each chat's own latest date; a new chat loads full history."""
+        mock_cli_args.days = 1
+        mock_cli_args.limit_messages = None
+        mock_cli_args.chats = "Chat1,Chat2,Chat3"
+        ts_a = int(datetime(2026, 11, 1, 12, 0).timestamp())
+        ts_b = int(datetime(2026, 10, 1, 12, 0).timestamp())
+
+        async def latest_for_chat(chat_id):
+            return {"1": ts_a, "2": ts_b}.get(str(chat_id))
+
+        mock_indexer_deps["db"].get_latest_message_date = AsyncMock(
+            side_effect=latest_for_chat
+        )
+
+        since_by_entity = {}
+
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+            del limit, kwargs
+            since_by_entity[entity] = since_date
+            yield self._create_mock_message(1, "Test message")
+
+        mock_indexer_deps["tg"].get_messages = mock_get_messages
+
+        indexer = TelegramIndexer(mock_cli_args)
+        indexer.db = mock_indexer_deps["db"]
+        indexer.tg_client = mock_indexer_deps["tg"]
+        indexer.chunker = mock_indexer_deps["chunker"]
+        indexer.embedder = mock_indexer_deps["embedder"]
+        indexer.vespa_client = mock_indexer_deps["vespa"]
+
+        async def mock_process_message(msg_data):
+            indexer.metrics.messages_indexed += 1
+
+        indexer.process_message = mock_process_message
+
+        await indexer.run_once()
+
+        assert since_by_entity["entity1"] == datetime.fromtimestamp(ts_a) - timedelta(
+            days=1
+        )
+        assert since_by_entity["entity2"] == datetime.fromtimestamp(ts_b) - timedelta(
+            days=1
+        )
+        assert since_by_entity["entity3"] is None
+
+    @pytest.mark.asyncio
+    async def test_backfill_batches_embeddings_across_messages(
+        self, mock_cli_args, mock_indexer_deps
+    ):
+        """Multiple short messages should share embed API calls up to batch size."""
+        mock_cli_args.limit_messages = 12
+        mock_cli_args.embed_batch_size = 5
+        mock_cli_args.chats = "Chat1"
+        mock_cli_args.days = 7
+
+        messages = [self._create_mock_message(i, f"Message {i}") for i in range(1, 13)]
+
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+            del entity, since_date, kwargs
+            to_yield = messages if limit is None else messages[:limit]
+            for msg in to_yield:
+                yield msg
+
+        mock_indexer_deps["tg"].get_messages = mock_get_messages
+        mock_indexer_deps["tg"].resolve_chats = AsyncMock(
+            return_value={
+                "Chat1": {
+                    "entity": "entity1",
+                    "id": "1",
+                    "title": "Chat 1",
+                    "type": "group",
+                },
+            }
+        )
+        mock_indexer_deps["tg"].get_all_chats = AsyncMock(return_value=["Chat1"])
+
+        embed_calls: list[list[str]] = []
+        compute_hash = mock_indexer_deps["embedder"]._compute_text_hash
+
+        async def track_embed_texts(texts, dry_run=False):
+            del dry_run
+            embed_calls.append(list(texts))
+            return [(compute_hash(text), [0.1, 0.2, 0.3]) for text in texts]
+
+        mock_indexer_deps["embedder"].embed_texts = track_embed_texts
+
+        with patch("main.settings") as mock_settings:
+            mock_settings.embed_model = "text-embedding-3-small"
+            mock_settings.chunking_version = 1
+            mock_settings.preprocess_version = 1
+            mock_settings.embed_dimensions = 1536
+            mock_settings.reply_context_tokens = 1000
+
+            indexer = TelegramIndexer(mock_cli_args)
+            indexer.db = mock_indexer_deps["db"]
+            indexer.tg_client = mock_indexer_deps["tg"]
+            indexer.chunker = mock_indexer_deps["chunker"]
+            indexer.embedder = mock_indexer_deps["embedder"]
+            indexer.vespa_client = mock_indexer_deps["vespa"]
+            indexer.embedder.batch_size = 5
+
+            await indexer.run_once()
+
+        assert len(embed_calls) == 3
+        assert [len(call) for call in embed_calls] == [5, 5, 2]
+        assert indexer.metrics.messages_indexed == 12
+        feed_args = mock_indexer_deps["vespa"].feed_documents.await_args_list
+        assert [len(call.args[0]) for call in feed_args] == [5, 5, 2]
 
     def _create_mock_message(self, message_id: int, text: str):
         """Helper to create mock message objects."""
@@ -761,3 +892,342 @@ class TestCLIArgs:
 
         chat_list = args.get_chat_list()
         assert chat_list == ["Chat1", "Chat2", "Chat3"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_reloads_incremental_window_from_db_max_date(
+    mock_cli_args, mock_indexer_deps
+):
+    """Daemon backfill re-scans N days before DB max message_date, not min_id only."""
+    from state import BackfillStateStore
+
+    mock_cli_args.backfill_state_path = None
+    mock_cli_args.once = False
+
+    db_max_ts = int(datetime(2020, 6, 15, 12, 0, 0).timestamp())
+    call_log: list[dict] = []
+
+    async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+        del entity, limit
+        call_log.append(
+            {
+                "since_date": since_date,
+                "reverse": kwargs.get("reverse"),
+                "min_message_id": kwargs.get("min_message_id"),
+            }
+        )
+        for _ in []:
+            yield _
+
+    mock_indexer_deps["db"].get_latest_message_date = AsyncMock(return_value=db_max_ts)
+    mock_indexer_deps["db"].get_latest_message_id = AsyncMock(return_value=42)
+    mock_indexer_deps["tg"].get_messages = mock_get_messages
+
+    with patch("main.settings") as mock_settings:
+        mock_settings.indexer_incremental_days = 1
+
+        indexer = TelegramIndexer(mock_cli_args)
+        indexer.db = mock_indexer_deps["db"]
+        indexer.tg_client = mock_indexer_deps["tg"]
+        indexer.backfill_state = BackfillStateStore(None)
+        await indexer.backfill_state.load()
+
+        chat_info = {"id": "10001", "entity": "entity", "title": "Test Chat"}
+        await indexer._backfill_chat(chat_info, None)
+
+    assert len(call_log) == 1
+    expected_since = datetime.fromtimestamp(db_max_ts) - timedelta(days=1)
+    assert call_log[0]["since_date"] == expected_since
+    assert call_log[0].get("reverse") is not True
+    assert call_log[0].get("min_message_id") is None
+
+
+class TestOneshotBatchProgress:
+    """Batch progress log line helpers and one-shot logging."""
+
+    def _prepared(self, message_id: int, message_date: int) -> "PreparedMessageIndex":
+        from models import PreparedMessageIndex
+
+        return PreparedMessageIndex(
+            msg_data={"message_id": message_id, "message_date": message_date},
+            bm25_text="test",
+            chunk_objects=[],
+            texts_to_embed=["text"],
+        )
+
+    def test_format_progress_duration(self):
+        from main import _format_progress_duration
+
+        assert _format_progress_duration(30) == "0m"
+        assert _format_progress_duration(3600) == "1h"
+        assert _format_progress_duration(7500) == "2h 5m"
+
+    def test_window_progress_segment_without_lower_bound(self):
+        from main import _window_progress_segment
+
+        now = datetime(2026, 1, 1, 12, 0)
+        assert (
+            _window_progress_segment(None, 1_700_000_000, 1_699_000_000, now, now)
+            == ""
+        )
+
+    def test_window_progress_segment_zero_percent_no_eta(self):
+        from main import _window_progress_segment
+
+        started = datetime(2026, 1, 1, 12, 0)
+        now = datetime(2026, 1, 1, 12, 10)
+        window_start = int(datetime(2026, 1, 1, 12, 0).timestamp())
+        since = datetime(2026, 1, 1, 10, 0)
+        cursor = window_start
+        segment = _window_progress_segment(since, window_start, cursor, started, now)
+        assert segment == "0%"
+
+    def test_format_batch_line_includes_cost_without_window(self):
+        from main import OneshotChatProgress, format_oneshot_batch_progress_line
+
+        started = datetime(2026, 1, 1, 12, 0)
+        ts = int(datetime(2026, 1, 1, 11, 30).timestamp())
+        progress = OneshotChatProgress(
+            chat_index=2,
+            chat_total=6,
+            title="Test Chat",
+            since_date=None,
+            window_start_ts=None,
+            messages_scanned=127500,
+            started_at=started,
+        )
+        batch = [self._prepared(1, ts), self._prepared(2, ts - 60)]
+        line = format_oneshot_batch_progress_line(progress, batch, 0.0421)
+        assert line.startswith("2/6 Test Chat | +2 msgs | 127500 |")
+        assert "2026-01-01 11:30" in line
+        assert "ETA" not in line
+        assert "%" not in line.split("|")[3]
+        assert line.endswith("$0.042100")
+
+    def test_format_batch_line_includes_percent_and_eta(self):
+        from main import OneshotChatProgress, format_oneshot_batch_progress_line
+
+        started = datetime(2026, 1, 1, 10, 0)
+        now = datetime(2026, 1, 1, 11, 0)
+        window_start = int(datetime(2026, 1, 1, 12, 0).timestamp())
+        since = datetime(2026, 1, 1, 10, 0)
+        cursor = int(datetime(2026, 1, 1, 11, 12).timestamp())
+        progress = OneshotChatProgress(
+            chat_index=1,
+            chat_total=1,
+            title="Window Chat",
+            since_date=since,
+            window_start_ts=window_start,
+            messages_scanned=64,
+            started_at=started,
+        )
+        batch = [self._prepared(10, cursor)]
+        line = format_oneshot_batch_progress_line(progress, batch, 0.01, now=now)
+        assert "| 38% ETA" in line or "| 40% ETA" in line or "% ETA" in line
+        assert "$0.010000" in line
+
+    @pytest.mark.asyncio
+    async def test_run_once_emits_batch_progress_not_per_message_progress(
+        self, mock_cli_args, mock_indexer_deps, caplog
+    ):
+        import logging
+
+        mock_cli_args.limit_messages = 12
+        mock_cli_args.chats = "Chat1"
+        mock_cli_args.days = None
+
+        messages = [
+            self._create_mock_message(i, f"Message {i}") for i in range(1, 13)
+        ]
+        for idx, msg in enumerate(messages, start=1):
+            msg.date.timestamp.return_value = datetime(2026, 1, 1, 12, idx).timestamp()
+
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+            del entity, since_date, kwargs
+            for message in messages[: limit or len(messages)]:
+                yield message
+
+        mock_indexer_deps["tg"].resolve_chats = AsyncMock(
+            return_value={
+                "Chat1": {
+                    "entity": "entity1",
+                    "id": "1",
+                    "title": "Chat 1",
+                    "type": "group",
+                },
+            }
+        )
+        mock_indexer_deps["tg"].get_messages = mock_get_messages
+        mock_indexer_deps["tg"].get_all_chats = AsyncMock(return_value=["Chat1"])
+
+        with patch("main.settings") as mock_settings:
+            mock_settings.embed_model = "text-embedding-3-small"
+            mock_settings.chunking_version = 1
+            mock_settings.preprocess_version = 1
+            mock_settings.embed_dimensions = 1536
+            mock_settings.reply_context_tokens = 1000
+
+            indexer = TelegramIndexer(mock_cli_args)
+            indexer.db = mock_indexer_deps["db"]
+            indexer.tg_client = mock_indexer_deps["tg"]
+            indexer.chunker = mock_indexer_deps["chunker"]
+            indexer.embedder = mock_indexer_deps["embedder"]
+            indexer.vespa_client = mock_indexer_deps["vespa"]
+            indexer.embedder.batch_size = 5
+
+            caplog.set_level(logging.INFO)
+            await indexer.run_once()
+
+        batch_lines = [
+            record.message
+            for record in caplog.records
+            if record.levelname == "INFO" and "+5 msgs" in record.message
+        ]
+        tail_line = next(
+            (
+                record.message
+                for record in caplog.records
+                if record.levelname == "INFO" and "+2 msgs" in record.message
+            ),
+            None,
+        )
+        assert len(batch_lines) == 2
+        assert tail_line is not None
+        assert all("1/1 Chat 1" in line for line in batch_lines)
+        assert "Processed 100 messages" not in caplog.text
+        assert "Fed 5/5 documents to Vespa" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_once_batch_line_includes_chat_index(
+        self, mock_cli_args, mock_indexer_deps, caplog
+    ):
+        import logging
+
+        mock_cli_args.limit_messages = 4
+        mock_cli_args.chats = "Chat1,Chat2"
+
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+            del since_date, kwargs
+            if entity == "entity1":
+                for i in range(1, 3):
+                    yield self._create_mock_message(i, f"C1-{i}")
+            elif entity == "entity2":
+                for i in range(3, 5):
+                    yield self._create_mock_message(i, f"C2-{i}")
+
+        mock_indexer_deps["tg"].resolve_chats = AsyncMock(
+            return_value={
+                "Chat1": {
+                    "entity": "entity1",
+                    "id": "1",
+                    "title": "Chat 1",
+                    "type": "group",
+                },
+                "Chat2": {
+                    "entity": "entity2",
+                    "id": "2",
+                    "title": "Chat 2",
+                    "type": "group",
+                },
+            }
+        )
+        mock_indexer_deps["tg"].get_messages = mock_get_messages
+
+        with patch("main.settings") as mock_settings:
+            mock_settings.embed_model = "text-embedding-3-small"
+            mock_settings.chunking_version = 1
+            mock_settings.preprocess_version = 1
+            mock_settings.embed_dimensions = 1536
+            mock_settings.reply_context_tokens = 1000
+
+            indexer = TelegramIndexer(mock_cli_args)
+            indexer.db = mock_indexer_deps["db"]
+            indexer.tg_client = mock_indexer_deps["tg"]
+            indexer.chunker = mock_indexer_deps["chunker"]
+            indexer.embedder = mock_indexer_deps["embedder"]
+            indexer.vespa_client = mock_indexer_deps["vespa"]
+            indexer.embedder.batch_size = 64
+
+            caplog.set_level(logging.INFO)
+            await indexer.run_once()
+
+        assert any("1/2 Chat 1" in record.message for record in caplog.records)
+        assert any("2/2 Chat 2" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_dry_run_emits_batch_progress_line(
+        self, mock_cli_args, mock_indexer_deps, caplog
+    ):
+        import logging
+
+        mock_cli_args.dry_run = True
+        mock_cli_args.limit_messages = 5
+        mock_cli_args.chats = "Chat1"
+
+        messages = [self._create_mock_message(i, f"Msg {i}") for i in range(1, 6)]
+
+        async def mock_get_messages(entity, limit=None, since_date=None, **kwargs):
+            del entity, since_date, kwargs
+            for message in messages:
+                yield message
+
+        mock_indexer_deps["tg"].resolve_chats = AsyncMock(
+            return_value={
+                "Chat1": {
+                    "entity": "entity1",
+                    "id": "1",
+                    "title": "Chat 1",
+                    "type": "group",
+                },
+            }
+        )
+        mock_indexer_deps["tg"].get_messages = mock_get_messages
+        mock_indexer_deps["tg"].get_all_chats = AsyncMock(return_value=["Chat1"])
+
+        with patch("main.settings") as mock_settings:
+            mock_settings.embed_model = "text-embedding-3-small"
+            mock_settings.chunking_version = 1
+            mock_settings.preprocess_version = 1
+            mock_settings.embed_dimensions = 1536
+            mock_settings.reply_context_tokens = 1000
+
+            indexer = TelegramIndexer(mock_cli_args)
+            indexer.db = mock_indexer_deps["db"]
+            indexer.tg_client = mock_indexer_deps["tg"]
+            indexer.chunker = mock_indexer_deps["chunker"]
+            indexer.embedder = mock_indexer_deps["embedder"]
+            indexer.vespa_client = mock_indexer_deps["vespa"]
+            indexer.embedder.batch_size = 5
+
+            caplog.set_level(logging.INFO)
+            await indexer.run_once()
+
+        assert any("+5 msgs" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_backfill_flush_skips_oneshot_progress_line(
+        self, mock_cli_args, mock_indexer_deps, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        indexer = TelegramIndexer(mock_cli_args)
+        indexer.db = mock_indexer_deps["db"]
+        indexer.tg_client = mock_indexer_deps["tg"]
+        indexer.chunker = mock_indexer_deps["chunker"]
+        indexer.embedder = mock_indexer_deps["embedder"]
+        indexer.vespa_client = mock_indexer_deps["vespa"]
+        indexer._oneshot_progress = None
+        batch = [self._prepared(1, int(datetime.now().timestamp()))]
+        await indexer._flush_prepared_messages(batch)
+        assert not any("+1 msgs" in record.message for record in caplog.records)
+
+    def _create_mock_message(self, message_id: int, text: str):
+        message = MagicMock()
+        message.id = message_id
+        message.text = text
+        message.date = MagicMock()
+        message.date.timestamp.return_value = datetime.now().timestamp()
+        message.action = None
+        message.media = None
+        return message

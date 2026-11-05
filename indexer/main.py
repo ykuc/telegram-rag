@@ -10,9 +10,9 @@ import argparse
 import logging
 import sys
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
-import hashlib
 
 from telethon import events
 
@@ -23,11 +23,109 @@ from normalize import normalize_text, create_header, compose_message_with_reply
 from chunker import TextChunker
 from embedder import Embedder
 from vespa_client import VespaClient
-from cost import CostEstimator
-from models import Chunk, VespaDocument, IndexerMetrics
+from cost import CostEstimator, embedding_price_per_1k
+from models import Chunk, VespaDocument, IndexerMetrics, PreparedMessageIndex
 from state import BackfillStateStore
 
 logger = logging.getLogger(__name__)
+
+
+_FETCH_WINDOW_TS_FMT = "%Y-%m-%d %H:%M"
+
+
+def log_message_fetch_window(
+    since_date: Optional[datetime], until_date: Optional[datetime] = None
+) -> str:
+    """Human-readable inclusive upper bound (through) for Telegram history fetch."""
+    until = until_date or datetime.now()
+    until_s = until.strftime(_FETCH_WINDOW_TS_FMT)
+    if since_date is None:
+        return f"through {until_s} (full history, no lower bound)"
+    since_s = since_date.strftime(_FETCH_WINDOW_TS_FMT)
+    return f"from {since_s} through {until_s}"
+
+
+@dataclass
+class OneshotChatProgress:
+    """Progress state for one-shot batch log lines."""
+
+    chat_index: int
+    chat_total: int
+    title: str
+    since_date: Optional[datetime]
+    window_start_ts: Optional[int]
+    messages_scanned: int
+    started_at: datetime
+
+
+def _format_progress_duration(seconds: float) -> str:
+    total_minutes = max(0, int(seconds // 60))
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if minutes:
+        return f"{hours}h {minutes}m"
+    return f"{hours}h"
+
+
+def _window_progress_segment(
+    since_date: Optional[datetime],
+    window_start_ts: Optional[int],
+    cursor_oldest_ts: int,
+    started_at: datetime,
+    now: datetime,
+) -> str:
+    if since_date is None or window_start_ts is None:
+        return ""
+    start_dt = datetime.fromtimestamp(window_start_ts)
+    end_dt = since_date
+    cursor_dt = datetime.fromtimestamp(cursor_oldest_ts)
+    total_seconds = (start_dt - end_dt).total_seconds()
+    if total_seconds <= 0:
+        return ""
+    done_seconds = (start_dt - cursor_dt).total_seconds()
+    percent = int(min(100, max(0, round(done_seconds / total_seconds * 100))))
+    if percent <= 0:
+        return f"{percent}%"
+    elapsed = (now - started_at).total_seconds()
+    if elapsed <= 0:
+        return f"{percent}%"
+    eta_seconds = elapsed * (100 - percent) / percent
+    return f"{percent}% ETA {_format_progress_duration(eta_seconds)}"
+
+
+def format_oneshot_batch_progress_line(
+    progress: OneshotChatProgress,
+    batch: List[PreparedMessageIndex],
+    cost_estimate: float,
+    now: Optional[datetime] = None,
+) -> str:
+    """Build the single INFO line emitted after each one-shot index batch."""
+    if not batch:
+        raise ValueError("batch must not be empty")
+    now = now or datetime.now()
+    message_dates = [prepared.msg_data["message_date"] for prepared in batch]
+    oldest_ts = min(message_dates)
+    newest_ts = max(message_dates)
+    batch_messages = len(batch)
+    window_part = _window_progress_segment(
+        progress.since_date,
+        progress.window_start_ts,
+        oldest_ts,
+        progress.started_at,
+        now,
+    )
+    date_range = (
+        f"{datetime.fromtimestamp(newest_ts).strftime(_FETCH_WINDOW_TS_FMT)} … "
+        f"{datetime.fromtimestamp(oldest_ts).strftime(_FETCH_WINDOW_TS_FMT)}"
+    )
+    middle = f" | {window_part}" if window_part else ""
+    return (
+        f"{progress.chat_index}/{progress.chat_total} {progress.title} | "
+        f"+{batch_messages} msgs | {progress.messages_scanned} | "
+        f"{date_range}{middle} | ${cost_estimate:.6f}"
+    )
 
 
 class TelegramIndexer:
@@ -67,6 +165,10 @@ class TelegramIndexer:
         )
         self.hourly_sweep_days = max(0, self._int_arg("hourly_sweep_days", 7))
         self._last_connection_state = True
+        self._index_batch: List[PreparedMessageIndex] = []
+        self._index_batch_chunk_count = 0
+        self._index_batch_lock = asyncio.Lock()
+        self._oneshot_progress: Optional[OneshotChatProgress] = None
 
         # Apply CLI overrides
         if args.embed_batch_size:
@@ -86,6 +188,18 @@ class TelegramIndexer:
             )
             return default
 
+    @property
+    def dry_run_enabled(self) -> bool:
+        """True only when CLI dry-run flag is explicitly enabled."""
+        return getattr(self.args, "dry_run", False) is True
+
+    def _embed_batch_threshold(self) -> int:
+        try:
+            size = int(self.embedder.batch_size)
+        except (TypeError, ValueError):
+            size = int(settings.embed_batch_size)
+        return max(1, size)
+
     async def initialize(self):
         """Initialize all clients and connections."""
         logger.info("Initializing indexer...")
@@ -104,6 +218,7 @@ class TelegramIndexer:
         logger.info("Cleaning up...")
 
         await self.tg_client.stop()
+        await self._flush_index_coalescer()
         await self.vespa_client.close()
         await self.db.close()
 
@@ -154,21 +269,21 @@ class TelegramIndexer:
 
         valid_chats = await self._prepare_target_chats("One-shot")
 
-        # Calculate date range (None means full history)
         if self.args.days is None:
-            since_date = None
-            logger.info("Fetching messages for entire available history")
+            logger.info("Fetching full history for each chat")
         else:
-            since_date = datetime.now() - timedelta(days=self.args.days)
             logger.info(
-                f"Fetching messages since {since_date.strftime('%Y-%m-%d %H:%M')}"
+                "Fetching each chat from its own latest indexed message "
+                "minus %s days, or full history when the chat has no indexed messages",
+                self.args.days,
             )
+
+        await self.backfill_state.load()
 
         # Process each chat with global message limit
         total_messages_processed = 0
-        for chat_name, chat_info in valid_chats:
-            logger.info(f"Processing chat: {chat_info['title']}")
-
+        chat_total = len(valid_chats)
+        for chat_index, (_chat_name, chat_info) in enumerate(valid_chats, start=1):
             # Calculate remaining message limit
             remaining_limit = None
             if self.args.limit_messages:
@@ -180,7 +295,10 @@ class TelegramIndexer:
                     break
 
             processed_count = await self.process_chat(
-                chat_info, since_date, remaining_limit
+                chat_info,
+                remaining_limit,
+                chat_index=chat_index,
+                chat_total=chat_total,
             )
             total_messages_processed += processed_count
 
@@ -265,6 +383,8 @@ class TelegramIndexer:
         for task in self._worker_tasks:
             with suppress(asyncio.CancelledError):
                 await task
+
+        await self._flush_index_coalescer()
 
         self._worker_tasks.clear()
 
@@ -388,15 +508,49 @@ class TelegramIndexer:
         self, chat_info: Dict[str, Any], limit_messages: Optional[int]
     ) -> int:
         chat_id = str(chat_info["id"])
+        fetch_until = datetime.now()
+        incremental_days = max(0, settings.indexer_incremental_days)
+        latest_ts = await self.db.get_latest_message_date(chat_id)
+
+        if latest_ts and incremental_days > 0:
+            latest_dt = datetime.fromtimestamp(latest_ts)
+            since_date = latest_dt - timedelta(days=incremental_days)
+            logger.info(
+                "Daemon incremental for %s: db max %s, reloading from %s through now",
+                chat_info.get("title"),
+                latest_dt.strftime(_FETCH_WINDOW_TS_FMT),
+                since_date.strftime(_FETCH_WINDOW_TS_FMT),
+            )
+            processed = await self._scan_chat_incremental_window(
+                chat_info, since_date, limit_messages
+            )
+            logger.info(
+                "Backfill complete for %s (%d messages)",
+                chat_info.get("title"),
+                processed,
+            )
+            return processed
+
         resume_from = await self.backfill_state.get_last_message_id(chat_id)
+        if resume_from is None:
+            db_max_id = await self.db.get_latest_message_id(chat_id)
+            if db_max_id:
+                resume_from = db_max_id
+                await self.backfill_state.update_chat(chat_id, db_max_id)
+                logger.info(
+                    "Seeded backfill checkpoint for %s from DB max message_id %s",
+                    chat_info.get("title"),
+                    db_max_id,
+                )
         since_date: Optional[datetime] = None
         if self.args.days is not None:
-            since_date = datetime.now() - timedelta(days=self.args.days)
+            since_date = fetch_until - timedelta(days=self.args.days)
 
         logger.info(
-            "Backfilling %s (resume from %s)",
+            "Backfilling %s (resume from %s, %s)",
             chat_info.get("title"),
             resume_from or "beginning",
+            log_message_fetch_window(since_date, fetch_until),
         )
 
         processed = 0
@@ -409,6 +563,7 @@ class TelegramIndexer:
             since_date=since_date,
             reverse=True,
             min_message_id=resume_from,
+            bulk_fetch=True,
         ):
             msg_data = self.tg_client.extract_message_data(message, chat_info["entity"])
             msg_data["chat_id"] = chat_id
@@ -450,12 +605,20 @@ class TelegramIndexer:
     ) -> int:
         chat_id = str(chat_info["id"])
         processed = 0
+        fetch_until = datetime.now()
+        logger.info(
+            "%s scan for %s (%s)",
+            reason,
+            chat_info.get("title"),
+            log_message_fetch_window(since_date, fetch_until),
+        )
 
         async for message in self.tg_client.get_messages(
             chat_info["entity"],
             limit=limit_messages,
             since_date=since_date,
             reverse=True,
+            bulk_fetch=True,
         ):
             msg_data = self.tg_client.extract_message_data(message, chat_info["entity"])
             msg_data["chat_id"] = chat_id
@@ -481,6 +644,56 @@ class TelegramIndexer:
 
         return processed
 
+    async def _scan_chat_incremental_window(
+        self,
+        chat_info: Dict[str, Any],
+        since_date: datetime,
+        limit_messages: Optional[int],
+    ) -> int:
+        """Re-fetch messages from since_date through now (newest first), for daemon overlap."""
+        chat_id = str(chat_info["id"])
+        fetch_until = datetime.now()
+        logger.info(
+            "Incremental overlap for %s (%s)",
+            chat_info.get("title"),
+            log_message_fetch_window(since_date, fetch_until),
+        )
+
+        processed = 0
+        latest_id = 0
+        checkpoint_counter = 0
+
+        async for message in self.tg_client.get_messages(
+            chat_info["entity"],
+            limit=limit_messages,
+            since_date=since_date,
+            bulk_fetch=True,
+        ):
+            msg_data = self.tg_client.extract_message_data(message, chat_info["entity"])
+            msg_data["chat_id"] = chat_id
+            msg_data["source_title"] = chat_info.get("title")
+            msg_data["chat_username"] = chat_info.get("username")
+
+            if not msg_data.get("text", "").strip():
+                continue
+
+            await self._enqueue_message_data(msg_data)
+            processed += 1
+            latest_id = max(latest_id, int(msg_data.get("message_id", 0)))
+            checkpoint_counter += 1
+
+            if limit_messages is not None and processed >= limit_messages:
+                break
+
+            if latest_id and checkpoint_counter >= self.backfill_checkpoint_interval:
+                await self.backfill_state.update_chat(chat_id, latest_id)
+                checkpoint_counter = 0
+
+        if latest_id:
+            await self.backfill_state.update_chat(chat_id, latest_id)
+
+        return processed
+
     async def _scan_recent_history(
         self, since_date: datetime, limit_messages: Optional[int], reason: str
     ) -> int:
@@ -500,11 +713,12 @@ class TelegramIndexer:
             return
 
         async with self._lookback_lock:
-            since_date = datetime.now() - self.lookback_window
+            fetch_until = datetime.now()
+            since_date = fetch_until - self.lookback_window
             logger.info(
-                "%s look-back since %s",
+                "%s look-back %s",
                 reason.capitalize(),
-                since_date.strftime("%Y-%m-%d %H:%M"),
+                log_message_fetch_window(since_date, fetch_until),
             )
             queued = await self._scan_recent_history(
                 since_date, self.lookback_message_limit, f"{reason} look-back"
@@ -577,8 +791,10 @@ class TelegramIndexer:
     async def process_chat(
         self,
         chat_info: Dict[str, Any],
-        since_date: datetime,
         limit_messages: Optional[int] = None,
+        *,
+        chat_index: Optional[int] = None,
+        chat_total: Optional[int] = None,
     ) -> int:
         """Process all messages in a chat.
 
@@ -588,11 +804,63 @@ class TelegramIndexer:
         chat_id = chat_info["id"]
         entity = chat_info["entity"]
 
+        fetch_until = datetime.now()
+
         messages_processed = 0
+        newest_message_ts: Optional[int] = None
+        chat_id_key = str(chat_id)
+        since_date: Optional[datetime] = None
+        if self.args.days is not None:
+            latest_ts = await self.db.get_latest_message_date(chat_id_key)
+            if latest_ts:
+                latest_dt = datetime.fromtimestamp(latest_ts)
+                since_date = latest_dt - timedelta(days=self.args.days)
+                logger.info(
+                    "Incremental window for %s: db max %s, loading from %s through now",
+                    chat_info["title"],
+                    latest_dt.strftime(_FETCH_WINDOW_TS_FMT),
+                    since_date.strftime(_FETCH_WINDOW_TS_FMT),
+                )
+            else:
+                logger.info(
+                    "No indexed messages for %s; loading full history",
+                    chat_info["title"],
+                )
+        logger.info(
+            "Processing chat: %s (%s)",
+            chat_info["title"],
+            log_message_fetch_window(since_date, fetch_until),
+        )
+        resume_offset = None
+        if since_date is None:
+            resume_offset = await self.backfill_state.get_oneshot_offset_id(chat_id_key)
+        if resume_offset:
+            logger.info(
+                "Resuming one-shot scan for %s from message id %s (older history)",
+                chat_info["title"],
+                resume_offset,
+            )
+        scan_floor_id: Optional[int] = resume_offset
+        checkpoint_counter = 0
+
+        if chat_index is not None and chat_total is not None:
+            self._oneshot_progress = OneshotChatProgress(
+                chat_index=chat_index,
+                chat_total=chat_total,
+                title=str(chat_info["title"]),
+                since_date=since_date,
+                window_start_ts=None,
+                messages_scanned=0,
+                started_at=datetime.now(),
+            )
 
         try:
             async for message in self.tg_client.get_messages(
-                entity, limit=limit_messages, since_date=since_date
+                entity,
+                limit=limit_messages,
+                since_date=since_date,
+                offset_message_id=resume_offset,
+                bulk_fetch=True,
             ):
                 self.metrics.messages_scanned += 1
 
@@ -609,17 +877,43 @@ class TelegramIndexer:
                 # Process the message
                 await self.process_message(msg_data)
                 messages_processed += 1
+                if self._oneshot_progress is not None:
+                    self._oneshot_progress.messages_scanned = messages_processed
+                    if self._oneshot_progress.window_start_ts is None:
+                        self._oneshot_progress.window_start_ts = msg_data[
+                            "message_date"
+                        ]
+                message_id = int(msg_data["message_id"])
+                if scan_floor_id is None or message_id < scan_floor_id:
+                    scan_floor_id = message_id
+                checkpoint_counter += 1
+                if (
+                    scan_floor_id
+                    and checkpoint_counter >= self.backfill_checkpoint_interval
+                ):
+                    await self.backfill_state.update_oneshot_offset(
+                        chat_id_key, scan_floor_id
+                    )
+                    checkpoint_counter = 0
+                if newest_message_ts is None:
+                    newest_message_ts = msg_data["message_date"]
+                    logger.info(
+                        "Newest indexed message in %s: %s",
+                        chat_info["title"],
+                        datetime.fromtimestamp(newest_message_ts).strftime(
+                            _FETCH_WINDOW_TS_FMT
+                        ),
+                    )
 
-                # Rate limiting and progress
                 if self.args.sleep_ms > 0:
                     await asyncio.sleep(self.args.sleep_ms / 1000)
 
-                if messages_processed % 100 == 0:
-                    logger.info(
-                        f"Processed {messages_processed} messages from {chat_info['title']}"
-                    )
-
         except Exception as e:
+            if scan_floor_id:
+                await self.backfill_state.update_oneshot_offset(
+                    chat_id_key, scan_floor_id
+                )
+            self._oneshot_progress = None
             logger.error(f"Error processing chat {chat_info['title']}: {e}")
             raise
 
@@ -627,24 +921,36 @@ class TelegramIndexer:
             f"Completed chat {chat_info['title']}: {messages_processed} messages processed"
         )
 
+        if scan_floor_id:
+            await self.backfill_state.update_oneshot_offset(chat_id_key, scan_floor_id)
+        await self.backfill_state.clear_oneshot_offset(chat_id_key)
+
+        await self._flush_index_coalescer()
+
+        self._oneshot_progress = None
         return messages_processed
 
     async def process_message(self, msg_data: Dict[str, Any]):
         """Process a single message into chunks and index them."""
+        prepared = await self.prepare_message_index(msg_data)
+        if prepared:
+            await self._add_prepared_to_batch(prepared)
+
+    async def prepare_message_index(
+        self, msg_data: Dict[str, Any]
+    ) -> Optional[PreparedMessageIndex]:
+        """Build chunk metadata for a message, or None if unchanged / empty."""
         chat_id = msg_data["chat_id"]
         message_id = msg_data["message_id"]
 
-        # Check if we already have chunks for this message
         existing_chunks = await self.db.get_existing_chunks(chat_id, message_id)
 
-        # If message hasn't been edited, skip reprocessing
         if existing_chunks and not self._message_needs_update(
             msg_data, existing_chunks
         ):
             logger.debug(f"Skipping unchanged message {message_id}")
-            return
+            return None
 
-        # Get reply context if needed
         reply_text = None
         if msg_data.get("reply_to_msg_id"):
             reply_msg = await self.tg_client.get_message_by_id(
@@ -653,7 +959,6 @@ class TelegramIndexer:
             if reply_msg and hasattr(reply_msg, "text"):
                 reply_text = reply_msg.text
 
-        # Normalize and compose message text
         text, bm25_text, has_link = normalize_text(msg_data["text"])
         header = create_header(
             msg_data.get("sender"),
@@ -665,29 +970,22 @@ class TelegramIndexer:
             text, reply_text, settings.reply_context_tokens
         )
 
-        # Create chunks
         chunks = self.chunker.chunk_text(composed_text, header)
 
         if not chunks:
             logger.warning(f"No chunks created for message {message_id}")
-            return
+            return None
 
-        # Process each chunk
-        chunk_objects = []
-        texts_to_embed = []
+        chunk_objects: List[Chunk] = []
+        texts_to_embed: List[str] = []
 
-        for chunk_idx, (full_text, chunk_bm25_text) in enumerate(chunks):
-            # Create chunk ID
+        for chunk_idx, (full_text, _chunk_bm25_text) in enumerate(chunks):
             chunk_id = (
                 f"{chat_id}:{message_id}:{chunk_idx}:v{settings.chunking_version}"
             )
 
-            # Compute text hash for caching
-            text_hash = hashlib.sha256(
-                f"{full_text}|{settings.embed_model}|{settings.chunking_version}|{settings.preprocess_version}".encode()
-            ).hexdigest()
+            text_hash = self.embedder._compute_text_hash(full_text)
 
-            # Create chunk object
             chunk_obj = Chunk(
                 chunk_id=chunk_id,
                 chat_id=chat_id,
@@ -707,65 +1005,140 @@ class TelegramIndexer:
             chunk_objects.append(chunk_obj)
             texts_to_embed.append(full_text)
 
-        # Get embeddings
-        embeddings = await self.embedder.embed_texts(texts_to_embed, self.args.dry_run)
+        return PreparedMessageIndex(
+            msg_data=msg_data,
+            bm25_text=bm25_text,
+            chunk_objects=chunk_objects,
+            texts_to_embed=texts_to_embed,
+        )
 
-        if self.args.dry_run:
-            logger.info(
-                f"DRY RUN: Would process {len(chunks)} chunks for message {message_id}"
-            )
+    async def _add_prepared_to_batch(self, prepared: PreparedMessageIndex) -> None:
+        batch_to_flush: Optional[List[PreparedMessageIndex]] = None
+        async with self._index_batch_lock:
+            self._index_batch.append(prepared)
+            self._index_batch_chunk_count += len(prepared.texts_to_embed)
+            if self._index_batch_chunk_count >= self._embed_batch_threshold():
+                batch_to_flush = self._index_batch
+                self._index_batch = []
+                self._index_batch_chunk_count = 0
+
+        if batch_to_flush:
+            await self._flush_prepared_messages(batch_to_flush)
+
+    async def _flush_index_coalescer(self) -> None:
+        batch_to_flush: Optional[List[PreparedMessageIndex]] = None
+        async with self._index_batch_lock:
+            if not self._index_batch:
+                return
+            batch_to_flush = self._index_batch
+            self._index_batch = []
+            self._index_batch_chunk_count = 0
+
+        if batch_to_flush:
+            await self._flush_prepared_messages(batch_to_flush)
+
+    def _vector_fields_for_embedding(
+        self, vector: List[float]
+    ) -> Tuple[Optional[dict], Optional[dict]]:
+        vector_dict = {"values": vector}
+        dim_raw = getattr(settings, "embed_dimensions", 3072)
+        dim = dim_raw if isinstance(dim_raw, int) else 3072
+        if dim == 1536:
+            return vector_dict, None
+        if dim == 3072:
+            return None, vector_dict
+        raise ValueError(
+            f"Unsupported embedding dimension: {dim}. Only 1536 and 3072 are supported."
+        )
+
+    async def _flush_prepared_messages(self, batch: List[PreparedMessageIndex]) -> None:
+        if not batch:
             return
 
-        # Create Vespa documents
-        vespa_docs = []
-        for chunk_obj, (text_hash, vector) in zip(chunk_objects, embeddings):
-            # Determine which vector field to use based on embedding dimensions
-            vector_dict = {"values": vector}
-            if settings.embed_dimensions == 1536:
-                vector_small = vector_dict
-                vector_large = None
-            elif settings.embed_dimensions == 3072:
-                vector_small = None
-                vector_large = vector_dict
-            else:
-                raise ValueError(
-                    f"Unsupported embedding dimension: {settings.embed_dimensions}. Only 1536 and 3072 are supported."
+        all_texts: List[str] = []
+        for prepared in batch:
+            all_texts.extend(prepared.texts_to_embed)
+
+        embeddings = await self.embedder.embed_texts(all_texts, self.dry_run_enabled)
+        embedding_by_hash = {text_hash: vector for text_hash, vector in embeddings}
+
+        if self.dry_run_enabled:
+            for prepared in batch:
+                self.metrics.messages_indexed += 1
+                self.metrics.chunks_written += len(prepared.chunk_objects)
+                logger.debug(
+                    "DRY RUN: would embed %s chunks for message %s",
+                    len(prepared.texts_to_embed),
+                    prepared.msg_data.get("message_id"),
+                )
+            self._log_oneshot_batch_progress(batch)
+            return
+
+        vespa_docs: List[VespaDocument] = []
+        for prepared in batch:
+            msg_data = prepared.msg_data
+            for chunk_obj, chunk_text in zip(
+                prepared.chunk_objects, prepared.texts_to_embed
+            ):
+                vector = embedding_by_hash.get(chunk_obj.text_hash)
+                if vector is None:
+                    raise RuntimeError(
+                        f"Missing embedding for chunk {chunk_obj.chunk_id}"
+                    )
+
+                vector_small, vector_large = self._vector_fields_for_embedding(vector)
+
+                vespa_docs.append(
+                    VespaDocument(
+                        id=chunk_obj.chunk_id,
+                        chat_id=chunk_obj.chat_id,
+                        message_id=chunk_obj.message_id,
+                        chunk_idx=chunk_obj.chunk_idx,
+                        source_title=msg_data.get("source_title"),
+                        sender=chunk_obj.sender,
+                        sender_username=chunk_obj.sender_username,
+                        chat_username=chunk_obj.chat_username,
+                        chat_type=chunk_obj.chat_type,
+                        message_date=chunk_obj.message_date,
+                        edit_date=chunk_obj.edit_date,
+                        thread_id=chunk_obj.thread_id,
+                        has_link=chunk_obj.has_link,
+                        text=chunk_text,
+                        bm25_text=prepared.bm25_text,
+                        vector_small=vector_small,
+                        vector_large=vector_large,
+                    )
                 )
 
-            doc = VespaDocument(
-                id=chunk_obj.chunk_id,
-                chat_id=chunk_obj.chat_id,
-                message_id=chunk_obj.message_id,
-                chunk_idx=chunk_obj.chunk_idx,
-                source_title=msg_data.get("source_title"),
-                sender=chunk_obj.sender,
-                sender_username=chunk_obj.sender_username,
-                chat_username=chunk_obj.chat_username,
-                chat_type=chunk_obj.chat_type,
-                message_date=chunk_obj.message_date,
-                edit_date=chunk_obj.edit_date,
-                thread_id=chunk_obj.thread_id,
-                has_link=chunk_obj.has_link,
-                text=texts_to_embed[chunk_obj.chunk_idx],
-                bm25_text=bm25_text,
-                vector_small=vector_small,
-                vector_large=vector_large,
-            )
-            vespa_docs.append(doc)
+        for prepared in batch:
+            for chunk_obj in prepared.chunk_objects:
+                await self.db.upsert_chunk(chunk_obj)
 
-        # Store in database
-        for chunk_obj in chunk_objects:
-            await self.db.upsert_chunk(chunk_obj)
-
-        # Feed to Vespa
         success_count = await self.vespa_client.feed_documents(vespa_docs)
 
-        self.metrics.messages_indexed += 1
-        self.metrics.chunks_written += len(chunk_objects)
+        for prepared in batch:
+            self.metrics.messages_indexed += 1
+            self.metrics.chunks_written += len(prepared.chunk_objects)
+            logger.debug(
+                "Processed message %s: %s chunks (batch feed %s/%s to Vespa)",
+                prepared.msg_data.get("message_id"),
+                len(prepared.texts_to_embed),
+                success_count,
+                len(vespa_docs),
+            )
 
-        logger.debug(
-            f"Processed message {message_id}: {len(chunks)} chunks, {success_count} fed to Vespa"
+        self._log_oneshot_batch_progress(batch)
+
+    def _log_oneshot_batch_progress(self, batch: List[PreparedMessageIndex]) -> None:
+        progress = self._oneshot_progress
+        if progress is None or not batch:
+            return
+        line = format_oneshot_batch_progress_line(
+            progress,
+            batch,
+            float(self.embedder.metrics.cost_estimate),
         )
+        logger.info(line)
 
     def _message_needs_update(
         self, msg_data: Dict[str, Any], existing_chunks: List[Chunk]
@@ -810,14 +1183,30 @@ class TelegramIndexer:
         )
 
         logger.info("=" * 60)
-        logger.info("INDEXING COMPLETE")
+        if self.dry_run_enabled:
+            logger.info("DRY RUN COMPLETE (no embedding API, no Vespa/DB writes)")
+        else:
+            logger.info("INDEXING COMPLETE")
         logger.info("=" * 60)
+        embed_model = settings.embed_model or "text-embedding-3-large"
+        price_per_1k = embedding_price_per_1k(embed_model)
+        logger.info(f"Embed model: {embed_model} (${price_per_1k:.5f}/1k input tokens)")
         logger.info(f"Messages scanned: {total_metrics.messages_scanned:,}")
         logger.info(f"Messages indexed: {total_metrics.messages_indexed:,}")
         logger.info(f"Chunks written: {total_metrics.chunks_written:,}")
+        if self.dry_run_enabled:
+            logger.info(
+                "Chunks/messages counts reflect what would be indexed (estimate mode)"
+            )
         logger.info(f"Cache hit rate: {cache_hit_rate:.1f}%")
-        logger.info(f"Embedding tokens: {total_metrics.total_tokens:,}")
-        logger.info(f"Estimated cost: ${total_metrics.cost_estimate:.4f}")
+        logger.info(f"Embedding tokens (new, est.): {total_metrics.total_tokens:,}")
+        logger.info(f"Estimated embed cost: ${total_metrics.cost_estimate:.6f}")
+        if total_metrics.chunks_written > 0:
+            avg_tokens = total_metrics.total_tokens / total_metrics.chunks_written
+            logger.info(
+                "Avg embed tokens per chunk: %.1f",
+                avg_tokens,
+            )
         logger.info(
             f"Vespa feeds: {total_metrics.vespa_feed_success:,} success, {total_metrics.vespa_feed_failures:,} failures"
         )
@@ -851,6 +1240,9 @@ def setup_logging(log_level: str):
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    # One line per Vespa/embed HTTP call drowns indexer progress. Failures stay visible.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def parse_args() -> CLIArgs:
@@ -867,10 +1259,19 @@ def parse_args() -> CLIArgs:
         "--days",
         type=int,
         default=None,
-        help="Days of history to fetch (default: entire history)",
+        help=(
+            "Per chat, reload this many days before the latest indexed message. "
+            "Chats with no indexed messages load full history. "
+            "Omit for full history on every chat."
+        ),
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Estimate costs without calling APIs"
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Walk Telegram + chunking; estimate tokens/cost only "
+            "(no embedding API, no Vespa feed, no chunk DB writes)"
+        ),
     )
     parser.add_argument(
         "--limit-messages", type=int, help="Limit number of messages (for testing)"
@@ -941,9 +1342,11 @@ def parse_args() -> CLIArgs:
 
     args = parser.parse_args()
 
+    chats = args.chats if args.chats else settings.indexer_chats
+
     return CLIArgs(
         once=args.once,
-        chats=args.chats,
+        chats=chats,
         days=args.days,
         dry_run=args.dry_run,
         limit_messages=args.limit_messages,
@@ -969,6 +1372,10 @@ async def main():
 
     logger.info("Starting Telegram RAG Indexer")
     logger.info(f"Mode: {'One-shot' if args.once else 'Daemon'}")
+    if args.dry_run:
+        logger.info(
+            "DRY RUN enabled: will estimate volume/cost only (no embed API / Vespa / chunk DB)"
+        )
 
     if args.once:
         indexer = TelegramIndexer(args)

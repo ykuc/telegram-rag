@@ -1,4 +1,6 @@
+.cursor
 .env
+ui/.astro/settings.json
 __pycache__/
 node_modules/
 ui/node_modules/

@@ -71,14 +71,22 @@ def test_models_requires_auth():
     assert r.status_code == 401
 
 
-def test_models_returns_mapping():
+def test_models_returns_mapping(monkeypatch):
     reset_attempts()
+
+    async def _fake_models():
+        return [{"id": "meta-llama/Meta-Llama-3.1-70B-Instruct", "label": "Llama 70B"}]
+
+    monkeypatch.setattr(
+        "app.main.fetch_chat_models_from_provider",
+        _fake_models,
+    )
     client = get_client()
     assert login(client).status_code == 200
     r = client.get("/models")
     assert r.status_code == 200
     data = r.json()
-    assert any(m["id"] == "gpt-5" for m in data)
+    assert any(m["id"] == "meta-llama/Meta-Llama-3.1-70B-Instruct" for m in data)
 
 
 def test_logout_clears_cookie():

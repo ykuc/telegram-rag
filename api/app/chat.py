@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from .search import SearchRequest, SearchResult, get_search_client
-from .models import resolve_model_id, DEFAULT_MODEL_ID
+from .openai_client import create_openai_client
 from .settings import settings
 
 logger = logging.getLogger(__name__)
@@ -138,11 +138,14 @@ chat_rate_limiter = ChatRateLimiter(
 class ContextAssembler:
     """Assembles search results into a context window within token budget."""
 
-    def __init__(self, model: str = DEFAULT_MODEL_ID):
+    def __init__(self, model: str | None = None):
         try:
-            self.tokenizer = tiktoken.encoding_for_model(model)
+            if model:
+                self.tokenizer = tiktoken.encoding_for_model(model)
+            else:
+                raise KeyError(model)
         except KeyError:
-            # Fallback to cl100k_base for unknown models
+            # Fallback to cl100k_base for unknown or third-party model ids
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
     def count_tokens(self, text: str) -> int:
@@ -355,12 +358,7 @@ class ChatService:
     """Service for handling chat requests with OpenAI."""
 
     def __init__(self):
-        if not settings.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required for chat")
-
-        self.openai_client = AsyncOpenAI(
-            api_key=settings.openai_api_key,
-        )
+        self.openai_client = create_openai_client()
 
         # Load system prompt
         self.system_prompt = self._load_system_prompt()
@@ -388,8 +386,11 @@ class ChatService:
         return content
 
     def _resolve_model_id(self, model_id: Optional[str]) -> str:
-        """Resolve model ID, using default if not provided."""
-        return model_id or DEFAULT_MODEL_ID
+        """Resolve model ID, using default from settings if not provided."""
+        resolved = model_id or settings.chat_default_model_id
+        if not resolved:
+            raise ValueError("model_id is required")
+        return resolved
 
     async def chat_stream(
         self, request: ChatRequest, user_id: str

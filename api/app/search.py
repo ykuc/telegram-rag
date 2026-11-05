@@ -102,15 +102,16 @@ class EmbeddingProvider:
     """OpenAI embedding provider."""
 
     def __init__(self):
-        from openai import AsyncOpenAI  # lazy import
+        from .openai_client import create_openai_client
 
         self.model = settings.embed_model
-        if not settings.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required")
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self.client = create_openai_client()
 
     async def embed(self, text: str) -> List[float]:
-        resp = await self.client.embeddings.create(model=self.model, input=[text])
+        kwargs: dict = {"model": self.model, "input": [text]}
+        if settings.embed_dimensions > 0:
+            kwargs["dimensions"] = settings.embed_dimensions
+        resp = await self.client.embeddings.create(**kwargs)
         return resp.data[0].embedding  # type: ignore[attr-defined]
 
 
@@ -955,13 +956,13 @@ class VespaSearchClient:
         embedded_vector: Optional[List[float]] = None
         query_params: Dict[str, str] = {}
 
-        # Determine vector field and ranking profile based on embedding model
-        if settings.embed_model == "text-embedding-3-small":
+        # Determine vector field and ranking profile from embedding dimensions
+        if settings.embed_dimensions == 1536:
             vector_field = "vector_small"
             ranking_profile = "hybrid-small"
             tensor_param = "qv_small"
             expected_dims = 1536
-        else:  # text-embedding-3-large or other large models
+        else:
             vector_field = "vector_large"
             ranking_profile = "hybrid-large"
             tensor_param = "qv_large"

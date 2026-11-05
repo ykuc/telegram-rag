@@ -114,3 +114,42 @@ async def test_get_message_by_id_stub():
     assert msg is not None
     assert msg.id == 42
     assert "Reply context" in msg.text
+
+
+@pytest.mark.asyncio
+async def test_get_messages_passes_iter_wait_from_settings():
+    original_stub = real_settings.telethon_stub
+    original_iter = real_settings.telethon_iter_wait_secs
+    original_delay = real_settings.telethon_inter_message_delay_secs
+    real_settings.telethon_stub = False
+    real_settings.telethon_iter_wait_secs = 0.75
+    real_settings.telethon_inter_message_delay_secs = 0.0
+    captured: dict = {}
+
+    msg = _make_message()
+
+    def mock_iter_messages(entity, **kwargs):
+        captured.update(kwargs)
+
+        async def _gen():
+            yield msg
+
+        return _gen()
+
+    try:
+        with patch("telethon_client.TelegramClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.iter_messages = mock_iter_messages
+            mock_client_cls.return_value = mock_client
+            wrapper = TelethonClientWrapper()
+            wrapper.client = mock_client
+
+            async for _ in wrapper.get_messages("entity", bulk_fetch=True):
+                pass
+    finally:
+        real_settings.telethon_stub = original_stub
+        real_settings.telethon_iter_wait_secs = original_iter
+        real_settings.telethon_inter_message_delay_secs = original_delay
+
+    assert captured.get("wait_time") == 0.75
+    assert captured.get("reverse") is False

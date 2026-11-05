@@ -1,18 +1,28 @@
 import React from "react";
-import { render, waitFor, fireEvent } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 import ModelPicker from "./ModelPicker";
-import { vi, test, expect } from "vitest";
+import { vi, test, expect, beforeEach, afterEach } from "vitest";
+import * as api from "../lib/api";
 
-vi.mock("../lib/api", () => {
-  const models = [
-    { label: "gpt 5", id: "gpt-5" },
-    { label: "gpt5 mini", id: "gpt-5-mini" },
-    { label: "gpt5 nano", id: "gpt-5-nano" },
-  ];
-  return { fetchModels: vi.fn().mockResolvedValue(models) };
+const models = [
+  { label: "Test Chat", id: "test/chat-model" },
+  { label: "Another", id: "test/another" },
+];
+
+beforeEach(() => {
+  vi.stubGlobal("localStorage", {
+    getItem: vi.fn(() => null),
+    setItem: vi.fn(),
+    removeItem: vi.fn(),
+    clear: vi.fn(),
+  });
+  vi.spyOn(api, "fetchModels").mockResolvedValue(models);
 });
 
-const { fetchModels } = await import("../lib/api");
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 test("ModelPicker loads options and stores selection", async () => {
   const mockOnModelChange = vi.fn();
@@ -20,17 +30,25 @@ test("ModelPicker loads options and stores selection", async () => {
     <ModelPicker onModelChange={mockOnModelChange} />,
   );
   await waitFor(() => {
-    expect(fetchModels).toHaveBeenCalled();
+    expect(api.fetchModels).toHaveBeenCalled();
   });
 
-  // The component uses a button, not a combobox
-  const button = getByRole("button", { name: /gpt 5/ });
-  expect(button).toBeDefined();
+  const button = await waitFor(() =>
+    getByRole("button", { name: /Test Chat/ }),
+  );
+  expect(button.textContent).toContain("Test Chat");
 
-  expect(button.textContent).toContain("gpt 5");
-
-  // Verify that the callback is called with the model ID, not label
   await waitFor(() => {
-    expect(mockOnModelChange).toHaveBeenCalledWith("gpt-5");
+    expect(mockOnModelChange).toHaveBeenCalledWith("test/chat-model");
+  });
+});
+
+test("ModelPicker shows error when models fail to load", async () => {
+  vi.mocked(api.fetchModels).mockRejectedValue({ status: 502 });
+  const { getByRole } = render(<ModelPicker />);
+  await waitFor(() => {
+    expect(getByRole("alert")).toHaveTextContent(
+      "Could not load models from the API.",
+    );
   });
 });

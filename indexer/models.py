@@ -1,7 +1,7 @@
 """Database models for indexer."""
 
-from typing import Optional
-from pydantic import BaseModel
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, ConfigDict
 
 
 class EmbeddingCache(BaseModel):
@@ -33,6 +33,17 @@ class Chunk(BaseModel):
     chat_type: Optional[str] = None
     thread_id: Optional[int] = None
     has_link: bool = False
+
+
+class PreparedMessageIndex(BaseModel):
+    """Chunks ready for batched embedding and Vespa feed."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    msg_data: Dict[str, Any]
+    bm25_text: str
+    chunk_objects: List[Chunk]
+    texts_to_embed: List[str]
 
 
 class VespaDocument(BaseModel):

@@ -3,6 +3,7 @@ import logging
 import sys
 import uuid
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -16,7 +17,7 @@ from .auth import (
     verify_password,
 )
 from .chat import ChatRequest, get_chat_service
-from .models import get_available_models
+from .models import fetch_chat_models_from_provider
 from .settings import settings
 from .search import SearchRequest, get_search_client
 
@@ -146,7 +147,24 @@ async def logout(response: Response):
 
 @app.get("/models")
 async def models() -> list[dict[str, str]]:
-    return get_available_models()
+    try:
+        return await fetch_chat_models_from_provider()
+    except httpx.HTTPStatusError as exc:
+        logging.getLogger(__name__).error(
+            "Provider models request failed: %s", exc.response.status_code
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch models from provider",
+        ) from exc
+    except httpx.RequestError as exc:
+        logging.getLogger(__name__).error("Provider models request error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Provider models endpoint unavailable",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/chats")

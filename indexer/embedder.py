@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 from models import EmbeddingCache, IndexerMetrics
 from db import DatabaseManager
 from settings import settings
+from cost import estimate_embedding_cost
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,11 @@ class Embedder:
         self.db = db
         # OpenAI client (guard against missing key during tests)
         api_key = getattr(settings, "openai_api_key", None) or "test-key"
-        self.client = AsyncOpenAI(api_key=api_key)
+        client_kwargs: dict[str, str] = {"api_key": api_key}
+        base_url = getattr(settings, "openai_base_url", None)
+        if isinstance(base_url, str) and base_url.strip():
+            client_kwargs["base_url"] = base_url.strip()
+        self.client = AsyncOpenAI(**client_kwargs)
         # Coerce settings values to stable primitives (avoid MagicMock leakage from patches)
         self.model = getattr(settings, "embed_model", "text-embedding-3-large")
         if not isinstance(self.model, str):
@@ -42,19 +47,24 @@ class Embedder:
             self.concurrency = 4
         self.metrics = IndexerMetrics()
 
-        # Pricing (per 1k tokens) - update these as needed
-        self.price_per_1k_tokens = {
-            "text-embedding-3-large": 0.00013,
-            "text-embedding-3-small": 0.00002,
-            "text-embedding-ada-002": 0.0001,
-        }
-
-        # Model dimensions
+        # Model dimensions (OpenAI defaults; Nebius Qwen uses settings.embed_dimensions)
         self.model_dimensions = {
             "text-embedding-3-large": 3072,
             "text-embedding-3-small": 1536,
             "text-embedding-ada-002": 1536,
         }
+
+    def _embedding_request_kwargs(self, input_texts: List[str]) -> dict:
+        """Build OpenAI embeddings.create kwargs (incl. Matryoshka dimensions)."""
+        kwargs: dict = {"model": self.model, "input": input_texts}
+        dim = getattr(settings, "embed_dimensions", None)
+        try:
+            dim_int = int(dim)
+        except (TypeError, ValueError):
+            dim_int = 0
+        if dim_int > 0:
+            kwargs["dimensions"] = dim_int
+        return kwargs
 
     def _compute_text_hash(self, text: str, lang: Optional[str] = None) -> str:
         """Compute hash for text caching."""
@@ -114,30 +124,34 @@ class Embedder:
                 self.metrics.embed_cached_misses += 1
 
         if not texts_to_embed:
-            logger.info(f"All {len(texts)} embeddings served from cache")
+            logger.debug(f"All {len(texts)} embeddings served from cache")
             return results
 
-        logger.info(
-            f"Need to embed {len(texts_to_embed)} texts, {len(results)} from cache"
+        log = logger.debug
+        log(
+            "Need to embed %s texts, %s from cache",
+            len(texts_to_embed),
+            len(results),
         )
 
-        # Estimate cost and tokens
-        total_tokens = sum(
-            len(text.split()) * 1.3 for text, _ in texts_to_embed
-        )  # rough estimate
-        estimated_cost = (total_tokens / 1000) * self.price_per_1k_tokens.get(
-            self.model, 0.0001
-        )
+        texts_to_embed_payload = [text for text, _ in texts_to_embed]
+        estimate = estimate_embedding_cost(texts_to_embed_payload, self.model)
+        total_tokens = int(estimate["tokens"])
+        estimated_cost = float(estimate["cost_usd"])
 
-        self.metrics.total_tokens += int(total_tokens)
+        self.metrics.total_tokens += total_tokens
         self.metrics.cost_estimate += estimated_cost
 
-        logger.info(
-            f"Estimated cost: ${estimated_cost:.4f} for {total_tokens:.0f} tokens"
+        log(
+            "Estimated cost: $%.6f for %s tokens (%s @ $%.5f/1k)",
+            estimated_cost,
+            f"{total_tokens:,}",
+            self.model,
+            estimate["price_per_1k_usd"],
         )
 
         if dry_run:
-            logger.info("Dry run mode - skipping actual embedding")
+            logger.debug("Dry run mode - skipping actual embedding")
             return results
         # Deterministic budget check (simplified to avoid flaky threshold logic)
         budget = self._coerce_float(
@@ -178,7 +192,7 @@ class Embedder:
                 await self.db.cache_embedding(cache_entry)
 
         self.metrics.embed_calls += len(tasks)
-        logger.info(f"Embedded {len(texts_to_embed)} texts in {len(tasks)} batches")
+        logger.debug(f"Embedded {len(texts_to_embed)} texts in {len(tasks)} batches")
 
         return results
 
@@ -193,7 +207,7 @@ class Embedder:
             for attempt in range(3):
                 try:
                     response = await self.client.embeddings.create(
-                        model=self.model, input=texts
+                        **self._embedding_request_kwargs(texts)
                     )
 
                     if len(response.data) != len(batch):

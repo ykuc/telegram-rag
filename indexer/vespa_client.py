@@ -141,7 +141,7 @@ class VespaClient:
 
         # Count successes
         success_count = sum(1 for result in results if result is True)
-        logger.info(f"Fed {success_count}/{len(docs)} documents to Vespa")
+        logger.debug(f"Fed {success_count}/{len(docs)} documents to Vespa")
 
         return success_count
 

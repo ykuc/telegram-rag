@@ -26,7 +26,7 @@ Self-hosted retrieval-augmented generation stack for searching and chatting over
 
 - Docker and Docker Compose
 - Telegram API ID + hash and a phone number for login
-- OpenAI API key (for embeddings/LLM)
+- OpenAI API key or Nebius Token Factory key (OpenAI-compatible API for embeddings and chat)
 - Optional: VoyageAI API key for reranking
 
 ## Setup
@@ -37,7 +37,7 @@ Self-hosted retrieval-augmented generation stack for searching and chatting over
    cd telegram-rag
    cp .env.example .env
    ```
-2. Edit `.env` with your credentials. Required values include `APP_USER`, `APP_USER_HASH_BCRYPT`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `OPENAI_API_KEY`. Optional keys such as `VOYAGE_API_KEY` enable reranking.
+2. Edit `.env` with your credentials. Required values include `APP_USER`, `APP_USER_HASH_BCRYPT`, `TG_API_ID`, `TG_API_HASH`, and `OPENAI_API_KEY`. On first indexer run, log in by scanning the QR code in Telegram (**Settings → Devices → Link Desktop Device**); the session is stored in the `telethon_session` volume. For [Nebius Token Factory](https://tokenfactory.nebius.com), set `OPENAI_BASE_URL=https://api.tokenfactory.nebius.com/v1/`, use your Token Factory API key as `OPENAI_API_KEY`, and align `EMBED_MODEL` / `EMBED_DIMENSIONS` with your Vespa index (for Nebius use `Qwen/Qwen3-Embedding-8B` with `EMBED_DIMENSIONS=1536` for `vector_small`). Chat models in the UI are loaded live from the provider; optional keys such as `VOYAGE_API_KEY` enable reranking.
 3. Install local tooling (recommended for contributors):
    ```bash
    make install        # api + indexer dependencies
@@ -83,13 +83,22 @@ The `vespa-deploy` service waits for Vespa to become healthy and then pushes `ve
 - **Hourly sweep**: by default the daemon re-scans the last 7 days every 60 minutes to catch late edits; tune with `--hourly-sweep-days` and `--hourly-sweep-interval-minutes`.
 - Telegram deletions are intentionally ignored—once ingested, messages remain searchable to preserve historical context.
 
-- First full sync: `docker compose run --rm indexer python main.py --once`
-- Target specific chats/dates (example):
+**Normal operation:** `docker compose up -d` runs the indexer daemon. Set `INDEXER_CHATS` and `INDEXER_INCREMENTAL_DAYS` in `.env` (empty `INDEXER_CHATS` indexes all chats). On first start the daemon backfills, then streams new messages.
+
+**First Telegram login** (no session in the `telethon_session` volume yet): `./scripts/indexer-once.sh` (interactive terminal for QR or phone code and 2FA). When signed in, stop that run and use `docker compose up` for the daemon.
+
+**One-shot backfill or dry-run** (with the daemon stopped): `./scripts/indexer-once.sh` with optional flags, e.g.:
+
   ```bash
-  docker compose run --rm indexer python main.py --once \
-    --chats '<Saved Messages>' --days 30 --limit-messages 50
+  ./scripts/indexer-once.sh --chats @example --days 365 --dry-run
   ```
-  After the backfill finishes, run the daemon without `--once` to stay current.
+
+  Read the final log block: messages scanned, chunks, embedding tokens, and estimated USD.
+
+- Example one-shot with a message cap:
+  ```bash
+  ./scripts/indexer-once.sh --chats '<Saved Messages>' --days 30 --limit-messages 50
+  ```
 
 Common daemon tuning flags:
 
@@ -125,6 +134,7 @@ scripts/            Helpers: deploy-vespa.sh, wait_for_health.sh, smoke_tests.sh
 
 - **Cannot log in**: confirm `APP_USER` and `APP_USER_HASH_BCRYPT`; check system clock for cookie expiry.
 - **Indexer stalled**: ensure the Telethon `.session` file exists on the Docker volume and inspect `docker compose logs indexer` for rate limiting.
+- **`sqlite3.OperationalError: database is locked` on Telethon connect** (common on Docker Desktop for Mac): use the `telethon_session` Docker volume in `docker-compose.yml`, not a bind mount of `indexer/sessions`. One-time migration: `./scripts/import-telethon-session-to-volume.sh`. Do not run the indexer daemon and `./scripts/indexer-once.sh` at the same time.
 - **Empty search results**: verify Vespa deployment (`docker compose logs vespa-deploy`) and that embeddings populated successfully.
 - **Rerank skipped**: set `VOYAGE_API_KEY` and `RERANK_ENABLED=true`.
 

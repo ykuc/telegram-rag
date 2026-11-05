@@ -600,7 +600,8 @@ async def test_preserves_single_header_for_formatted_messages(
     mock_http: AsyncMock,
     mock_embedder: AsyncMock,
 ) -> None:
-    formatted_text = "[2025-09-04 06:14 • Iryna Tyshyk] Десь о 13 буду у Катовіце"
+    formatted_text = "[2020-01-01 00:00 • Test User] Sample message about a place"
+    timestamp_ms = 1577836800000  # 2020-01-01 00:00:00 UTC
     seed_payload = {
         "root": {
             "children": [
@@ -609,9 +610,9 @@ async def test_preserves_single_header_for_formatted_messages(
                     200,
                     text=formatted_text,
                     score=0.87,
-                    timestamp_ms=1693808040000,
-                    sender="Iryna Tyshyk",
-                    sender_username="iryna",
+                    timestamp_ms=timestamp_ms,
+                    sender="Test User",
+                    sender_username="testuser",
                 )
             ]
         }
@@ -623,9 +624,9 @@ async def test_preserves_single_header_for_formatted_messages(
                     "chat-4",
                     200,
                     text=formatted_text,
-                    timestamp_ms=1693808040000,
-                    sender="Iryna Tyshyk",
-                    sender_username="iryna",
+                    timestamp_ms=timestamp_ms,
+                    sender="Test User",
+                    sender_username="testuser",
                 )
             ]
         }
@@ -636,7 +637,7 @@ async def test_preserves_single_header_for_formatted_messages(
         async_response(neighbor_payload),
     ]
 
-    req = SearchRequest(q="катовіце", hybrid=False, limit=1)
+    req = SearchRequest(q="place", hybrid=False, limit=1)
     results = await search_client.search(req)
 
     assert len(results) == 1
@@ -644,7 +645,7 @@ async def test_preserves_single_header_for_formatted_messages(
 
     line = results[0].text.splitlines()[0]
     assert line == formatted_text
-    assert line.count("[2025-09-04 06:14") == 1
+    assert line.count("[2020-01-01 00:00") == 1
 
 
 def async_response(payload: dict[str, Any]):
@@ -659,3 +660,16 @@ def async_response(payload: dict[str, Any]):
             return None
 
     return _Response(payload)
+
+
+@pytest.mark.asyncio
+async def test_build_query_uses_small_vectors_for_1536_dimensions(
+    search_client: VespaSearchClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "embed_dimensions", 1536)
+    monkeypatch.setattr(settings, "embed_model", "BAAI/bge-en-icl")
+    req = SearchRequest(q="hello", hybrid=True, limit=5)
+    _yql, body, _params = await search_client._build_query(req)
+    assert body["ranking"] == "hybrid-small"
+    assert "input.query(qv_small)" in body

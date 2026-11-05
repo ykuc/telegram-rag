@@ -328,9 +328,12 @@ class TestEmbedder:
 
     def test_price_configuration(self):
         """Test that embedding prices are configured."""
-        assert "text-embedding-3-small" in self.embedder.price_per_1k_tokens
-        assert "text-embedding-3-large" in self.embedder.price_per_1k_tokens
-        assert all(price > 0 for price in self.embedder.price_per_1k_tokens.values())
+        from cost import EMBEDDING_USD_PER_1K_TOKENS
+
+        assert "text-embedding-3-small" in EMBEDDING_USD_PER_1K_TOKENS
+        assert "text-embedding-3-large" in EMBEDDING_USD_PER_1K_TOKENS
+        assert "Qwen/Qwen3-Embedding-8B" in EMBEDDING_USD_PER_1K_TOKENS
+        assert all(price > 0 for price in EMBEDDING_USD_PER_1K_TOKENS.values())
 
     @pytest.mark.asyncio
     async def test_mixed_cache_scenario(self):

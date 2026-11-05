@@ -172,8 +172,20 @@ async def test_health_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_models_endpoint():
+async def test_models_endpoint(monkeypatch):
     """Test that models endpoint works."""
+
+    async def _fake_models():
+        return [
+            {"id": "gpt-5", "label": "gpt 5"},
+            {"id": "gpt-5-mini", "label": "gpt5 mini"},
+        ]
+
+    monkeypatch.setattr(
+        "app.main.fetch_chat_models_from_provider",
+        _fake_models,
+    )
+
     async with AsyncClient(app=app, base_url="http://test") as client:
         response = await client.get("/models", cookies=auth_cookie())
         assert response.status_code == 200
