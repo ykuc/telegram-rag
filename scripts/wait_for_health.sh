@@ -67,7 +67,10 @@ if docker compose ps --status running --services 2>/dev/null | grep -qx postgres
 	docker compose exec -T postgres pg_isready -U "${POSTGRES_USER:-telegram_rag}" >/dev/null
 else
 	if [[ -z ${DATABASE_URL:-} && -f .env ]]; then
-		DATABASE_URL="$(grep -E '^DATABASE_URL=' .env | tail -n 1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+		set -a
+		# shellcheck disable=SC1091
+		. ./.env
+		set +a
 	fi
 	if [[ -z ${DATABASE_URL:-} ]]; then
 		echo "DATABASE_URL is required when the local postgres service is not running" >&2

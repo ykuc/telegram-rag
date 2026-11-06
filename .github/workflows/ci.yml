@@ -6,11 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  DOCKER_COMPOSE_DATABASE_URL: postgresql://telegram_rag:postgres@postgres:5432/telegram_rag
+
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://telegram_rag:postgres@postgres:5432/telegram_rag
+      DATABASE_URL: ${{ env.DOCKER_COMPOSE_DATABASE_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,7 +87,7 @@ jobs:
   e2e-tests:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://telegram_rag:postgres@postgres:5432/telegram_rag
+      DATABASE_URL: ${{ env.DOCKER_COMPOSE_DATABASE_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

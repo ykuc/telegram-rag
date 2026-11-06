@@ -55,10 +55,16 @@ PY
 
 ## Running the Stack
 
+### Postgres (shared vs local)
+
+- **Shared `common-pg`:** create Docker network `common-pg`, run the sibling `common-pg` compose project and provision DB/role, then set `DATABASE_URL` in `.env` to use host `common-pg` (see `.env.example`). Run `docker compose up -d --build` — the in-repo `postgres` service is omitted unless you use the profile below.
+- **Local Postgres in this repo:** `docker compose --profile personal-db up -d --build` and point `DATABASE_URL` at host `postgres` (commented line in `.env.example`).
+- **`scripts/wait_for_health.sh`** checks the DB with `pg_isready` on the local compose `postgres` when it is running; otherwise it uses `DATABASE_URL` from the environment or from `.env` (sourced by the script).
+
 ### Development
 
 ```bash
-docker compose up -d api vespa postgres indexer vespa-deploy
+docker compose --profile personal-db up -d api vespa postgres indexer vespa-deploy
 (cd ui && npm run dev)
 ```
 
@@ -72,7 +78,7 @@ docker compose up -d api vespa postgres indexer vespa-deploy
 docker compose up -d --build
 ```
 
-The `vespa-deploy` service waits for Vespa to become healthy and then pushes `vespa/application` automatically.
+Use `--profile personal-db` if your `.env` targets host `postgres` inside this project. The `vespa-deploy` service waits for Vespa to become healthy and then pushes `vespa/application` automatically.
 
 ## Indexing Telegram Data
 
@@ -89,11 +95,11 @@ The `vespa-deploy` service waits for Vespa to become healthy and then pushes `ve
 
 **One-shot backfill or dry-run** (with the daemon stopped): `./scripts/indexer-once.sh` with optional flags, e.g.:
 
-  ```bash
-  ./scripts/indexer-once.sh --chats @example --days 365 --dry-run
-  ```
+```bash
+./scripts/indexer-once.sh --chats @example --days 365 --dry-run
+```
 
-  Read the final log block: messages scanned, chunks, embedding tokens, and estimated USD.
+Read the final log block: messages scanned, chunks, embedding tokens, and estimated USD.
 
 - Example one-shot with a message cap:
   ```bash

@@ -17,8 +17,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - default
     deploy:
       resources:
         limits:
@@ -142,7 +140,6 @@ services:
           memory: 256M
 
 volumes:
-  postgres_data:
   personal_postgres_data:
   vespa_data:
   telethon_session:
