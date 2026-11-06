@@ -62,7 +62,22 @@ fi
 wait_for "API" "http://localhost:8000/healthz"
 wait_for "UI" "http://localhost:3000/"
 
-docker compose exec -T postgres pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null
+# /healthz does not query Postgres. Probe the database itself.
+if docker compose ps --status running --services 2>/dev/null | grep -qx postgres; then
+	docker compose exec -T postgres pg_isready -U "${POSTGRES_USER:-telegram_rag}" >/dev/null
+else
+	if [[ -z ${DATABASE_URL:-} && -f .env ]]; then
+		DATABASE_URL="$(grep -E '^DATABASE_URL=' .env | tail -n 1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+	fi
+	if [[ -z ${DATABASE_URL:-} ]]; then
+		echo "DATABASE_URL is required when the local postgres service is not running" >&2
+		exit 1
+	fi
+	if ! docker run --rm --network common-pg postgres:18-alpine pg_isready -d "$DATABASE_URL" >/dev/null; then
+		echo "Postgres at DATABASE_URL is not accepting connections" >&2
+		exit 1
+	fi
+fi
 
 echo "Postgres is up"
 

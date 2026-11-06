@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://telegram_rag:postgres@postgres:5432/telegram_rag
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +22,8 @@ jobs:
       - run: pip install pre-commit
       - run: pre-commit run --all-files
       - run: cp .env.example .env
-      - run: docker compose up -d --build
+      - run: docker network create common-pg || true
+      - run: docker compose --profile personal-db up -d --build
       - run: ./scripts/wait_for_health.sh
       - run: ./scripts/smoke_tests.sh
 
@@ -80,6 +83,8 @@ jobs:
 
   e2e-tests:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://telegram_rag:postgres@postgres:5432/telegram_rag
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -90,8 +95,10 @@ jobs:
           node-version: "20"
       - name: Setup environment
         run: cp .env.example .env
+      - name: Create shared network
+        run: docker network create common-pg || true
       - name: Start backend services
-        run: docker compose up -d --build
+        run: docker compose --profile personal-db up -d --build
       - name: Wait for services to be healthy
         run: ./scripts/wait_for_health.sh
       - name: Cache UI node_modules
