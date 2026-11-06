@@ -22,10 +22,6 @@ services:
       - ASTRO_TELEMETRY_DISABLED=1
       - NODE_OPTIONS=--max-old-space-size=640
 
-  postgres:
-    ports:
-      - "5432:5432"
-
 volumes:
   api_reload_cache:
   ui_node_modules:

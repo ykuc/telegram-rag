@@ -1,18 +1,24 @@
 services:
   postgres:
-    image: postgres:15-alpine
-    env_file: .env
+    profiles: ["personal-db"]
+    image: postgres:18-alpine
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-telegram_rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-telegram_rag}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - personal_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-telegram_rag} -d ${POSTGRES_DB:-telegram_rag}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
     deploy:
       resources:
         limits:
@@ -76,6 +82,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
+    networks:
+      - default
+      - common-pg
     ports:
       - "8000:8000"
     healthcheck:
@@ -118,8 +128,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
       vespa-deploy:
         condition: service_completed_successfully
+    networks:
+      - default
+      - common-pg
     deploy:
       resources:
         limits:
@@ -129,5 +143,11 @@ services:
 
 volumes:
   postgres_data:
+  personal_postgres_data:
   vespa_data:
   telethon_session:
+
+networks:
+  common-pg:
+    external: true
+    name: common-pg
