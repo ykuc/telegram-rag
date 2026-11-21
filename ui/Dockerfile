@@ -10,6 +10,7 @@ RUN npm run build
 # Development stage with full deps and source for hot reload
 FROM node:20-alpine AS dev
 WORKDIR /app
+RUN apk add --no-cache curl
 COPY package.json .
 RUN npm install
 COPY astro.config.mjs .
