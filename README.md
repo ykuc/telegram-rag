@@ -57,13 +57,13 @@ PY
 
 ### Postgres (shared vs local)
 
-- **Shared Postgres:** run sibling `../common-infra/pg` (`docker compose up -d`), provision with `scripts/provision-role.sh`, set `DATABASE_URL` to host `common-pg` (see `.env.example`). Run `docker compose up -d --build` — the in-repo `postgres` service is omitted unless you use the profile below.
+- **Shared Postgres:** run sibling `../common-infra` (`make pg-up && make pg-provision`), set `DATABASE_URL` to host `common-pg` (see `.env.example`). Run `docker compose up -d --build` — the in-repo `postgres` service is omitted unless you use the profile below.
 - **Local Postgres in this repo:** `docker compose --profile personal-db up -d --build` and point `DATABASE_URL` at host `postgres` (commented line in `.env.example`).
 - **`scripts/wait_for_health.sh`** checks the DB with `pg_isready` on the local compose `postgres` when it is running; otherwise it uses `DATABASE_URL` from the environment or from `.env` (sourced by the script).
 
 ### Development
 
-Start `../common-infra/pg` first. `.env` `DATABASE_URL` uses host `common-pg`.
+Start `../common-infra` (`make pg-up && make pg-provision`) first. `.env` `DATABASE_URL` uses host `common-pg`.
 
 ```bash
 docker compose up -d api vespa indexer vespa-deploy
